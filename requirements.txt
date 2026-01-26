@@ -1,0 +1,38 @@
+# Core Dependencies
+python-dotenv==1.0.0
+anthropic==0.18.1
+
+# Database
+supabase==2.3.4
+
+# Mobile Interface
+python-telegram-bot==20.7
+
+# Data Analysis
+pandas==2.1.4
+numpy==1.26.2
+
+# Git Operations
+gitpython==3.1.40
+
+# Payment Integration
+stripe==7.10.0
+
+# NLP & Sentiment Analysis
+transformers==4.36.2
+torch==2.1.2
+
+# HTTP & API
+httpx==0.26.0
+requests==2.31.0
+
+# Scheduling
+schedule==1.2.1
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.23.3
+pytest-mock==3.12.0
+
+# Utilities
+pydantic==2.5.3
