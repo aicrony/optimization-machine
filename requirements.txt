@@ -1,30 +1,34 @@
 # Core Dependencies
-python-dotenv==1.0.0
-anthropic==0.18.1
+python-dotenv>=1.0.0
+anthropic>=0.40.0
 
 # Database
-supabase==2.3.4
+supabase>=2.10.0
 
 # Mobile Interface
-python-telegram-bot==20.7
+python-telegram-bot>=21.0
 
 # Data Analysis
-pandas==2.1.4
-numpy==1.26.2
+pandas>=2.1.4,<3.0
+numpy>=1.26.2,<2.0
 
 # Git Operations
-gitpython==3.1.40
+gitpython>=3.1.40
 
 # Payment Integration
-stripe==7.10.0
+stripe>=7.10.0
 
 # NLP & Sentiment Analysis
-transformers==4.36.2
-torch==2.1.2
+transformers>=4.36.0
+torch>=2.2.0
 
 # HTTP & API
-httpx==0.26.0
-requests==2.31.0
+httpx>=0.26
+requests>=2.31.0
+
+# Analytics
+google-analytics-data==0.18.7
+google-cloud-datastore>=2.19.0
 
 # Scheduling
 schedule==1.2.1

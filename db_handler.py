@@ -62,7 +62,10 @@ class DatabaseHandler:
                 'status': strategy.get('status', 'pending'),
                 'priority': strategy.get('priority', 0),
                 'focus_area': strategy.get('focus_area'),
-                'data_snapshot': json.dumps(strategy.get('data_snapshot', {}))
+                'data_snapshot': json.dumps({
+                    **strategy.get('data_snapshot', {}),
+                    **(({'dependency_analysis': strategy['dependency_analysis']} if 'dependency_analysis' in strategy else {}))
+                })
             }).execute()
 
             strategy_id = result.data[0]['id']
@@ -80,9 +83,44 @@ class DatabaseHandler:
         return self._retry_operation(_get)
 
     def get_pending_strategies(self) -> List[Dict]:
-        """Get all pending strategies"""
+        """Get all pending strategies, most recent first"""
         def _get():
-            result = self.client.table('strategies').select('*').eq('status', 'pending').order('priority', desc=True).execute()
+            # Order by created_at descending to get the most recent pending strategy first
+            # This ensures the mobile interface responds to the strategy the loop controller
+            # is currently waiting on, not an old one
+            result = self.client.table('strategies').select('*').eq('status', 'pending').order('created_at', desc=True).execute()
+            return result.data
+
+        return self._retry_operation(_get)
+
+    def get_saved_strategies(self) -> List[Dict]:
+        """Get all saved strategies (not yet implemented), most recent first"""
+        def _get():
+            result = self.client.table('strategies').select('*').eq('status', 'saved').order('created_at', desc=True).execute()
+            return result.data
+
+        return self._retry_operation(_get)
+
+    def get_failed_strategies(self) -> List[Dict]:
+        """Get all failed strategies, most recent first"""
+        def _get():
+            result = self.client.table('strategies').select('*').eq('status', 'failed').order('created_at', desc=True).execute()
+            return result.data
+
+        return self._retry_operation(_get)
+
+    def get_rejected_strategies(self) -> List[Dict]:
+        """Get all rejected strategies, most recent first"""
+        def _get():
+            result = self.client.table('strategies').select('*').eq('status', 'rejected').order('created_at', desc=True).execute()
+            return result.data
+
+        return self._retry_operation(_get)
+
+    def get_approved_strategies(self) -> List[Dict]:
+        """Get all approved strategies (ready for execution), most recent first"""
+        def _get():
+            result = self.client.table('strategies').select('*').eq('status', 'approved').order('created_at', desc=True).execute()
             return result.data
 
         return self._retry_operation(_get)
@@ -96,6 +134,98 @@ class DatabaseHandler:
             logger.info(f"Strategy {strategy_id} status updated to {status}")
 
         self._retry_operation(_update)
+
+    def split_strategy(self, strategy_id: int) -> List[int]:
+        """Split a multi-change strategy into individual strategies, one per change.
+        Marks the original as rejected. Returns list of new strategy IDs."""
+        original = self.get_strategy(strategy_id)
+        if not original:
+            raise ValueError(f"Strategy {strategy_id} not found")
+
+        changes = original.get('changes', [])
+        if isinstance(changes, str):
+            changes = json.loads(changes)
+
+        if len(changes) <= 1:
+            raise ValueError("Strategy has only one change, nothing to split")
+
+        new_ids = []
+        for change in changes:
+            new_strategy = {
+                'summary': change.get('action', original['summary']),
+                'changes': [change],
+                'expected_impact': change.get('expected_impact', original.get('expected_impact')),
+                'status': original.get('status', 'pending'),
+                'priority': original.get('priority', 0),
+                'focus_area': original.get('focus_area'),
+                'data_snapshot': original.get('data_snapshot', {}),
+            }
+            # data_snapshot may already be a dict from get_strategy
+            if isinstance(new_strategy['data_snapshot'], str):
+                try:
+                    new_strategy['data_snapshot'] = json.loads(new_strategy['data_snapshot'])
+                except (json.JSONDecodeError, TypeError):
+                    new_strategy['data_snapshot'] = {}
+            new_id = self.write_strategy(new_strategy)
+            new_ids.append(new_id)
+
+        # Mark original as rejected
+        self.update_strategy_status(strategy_id, 'rejected')
+        logger.info(f"Strategy {strategy_id} split into {len(new_ids)} strategies: {new_ids}")
+        return new_ids
+
+    def update_execution_stage(self, strategy_id: int, stage: str, metadata: Optional[Dict] = None) -> None:
+        """
+        Update the execution stage of a strategy for progress tracking.
+
+        Stages:
+        - waiting_approval: Initial state
+        - generating_code: Code generation in progress
+        - pushing_branch: Pushing to GitHub
+        - waiting_merge: Preview deployed, waiting for merge
+        - merging: Merge in progress
+        - completed: Done
+
+        Args:
+            strategy_id: Strategy ID
+            stage: Execution stage name
+            metadata: Optional metadata (branch_name, preview_url, etc.) for resume
+        """
+        def _update():
+            update_data = {
+                'execution_stage': stage,
+                'stage_updated_at': datetime.utcnow().isoformat()
+            }
+            if metadata:
+                update_data['execution_metadata'] = json.dumps(metadata)
+            self.client.table('strategies').update(update_data).eq('id', strategy_id).execute()
+            logger.info(f"Strategy {strategy_id} execution stage: {stage}")
+
+        self._retry_operation(_update)
+
+    def get_stuck_strategies(self) -> List[Dict]:
+        """
+        Get strategies that are in an intermediate execution state (potentially stuck).
+        These are strategies with status 'approved' or 'preview' that may need to be resumed.
+        """
+        def _get():
+            # Get strategies in approved or preview status (not terminal states)
+            result = self.client.table('strategies').select('*').in_(
+                'status', ['approved', 'preview']
+            ).order('created_at', desc=True).execute()
+            return result.data
+
+        return self._retry_operation(_get)
+
+    def get_strategy_execution_metadata(self, strategy_id: int) -> Optional[Dict]:
+        """Get execution metadata for a strategy (for resume)"""
+        strategy = self.get_strategy(strategy_id)
+        if strategy and strategy.get('execution_metadata'):
+            try:
+                return json.loads(strategy['execution_metadata'])
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return None
 
     # ============ APPROVALS ============
 
@@ -116,28 +246,82 @@ class DatabaseHandler:
 
         return self._retry_operation(_write)
 
-    def get_approval(self, strategy_id: int) -> Optional[Dict]:
-        """Get approval for a strategy (polls for user response)"""
+    def get_approval(self, strategy_id: int, after_timestamp: Optional[str] = None) -> Optional[Dict]:
+        """
+        Get the latest approval for a strategy
+
+        Args:
+            strategy_id: Strategy ID to get approval for
+            after_timestamp: If provided, only return approvals created after this ISO timestamp
+
+        Returns:
+            Latest approval dict or None
+        """
         def _get():
-            result = self.client.table('approvals').select('*').eq('strategy_id', strategy_id).execute()
+            query = self.client.table('approvals').select('*').eq('strategy_id', strategy_id)
+
+            # Filter by timestamp if provided
+            if after_timestamp:
+                query = query.gt('created_at', after_timestamp)
+
+            # Get latest approval (most recent first)
+            result = query.order('created_at', desc=True).limit(1).execute()
             return result.data[0] if result.data else None
 
         return self._retry_operation(_get)
 
-    def wait_for_approval(self, strategy_id: int, timeout_minutes: int = 1440, poll_interval: int = 300) -> Optional[Dict]:
-        """Wait for user approval with timeout (default 24 hours, poll every 5 min)"""
+    def wait_for_approval(self, strategy_id: int, timeout_minutes: int = 1440,
+                          poll_interval: int = 300, response_types: Optional[List[str]] = None,
+                          fast_poll_interval: int = 15, fast_poll_duration: int = 600,
+                          after_timestamp: Optional[str] = None,
+                          require_new: bool = False) -> Optional[Dict]:
+        """
+        Wait for user approval with adaptive polling.
+
+        Args:
+            strategy_id: Strategy to wait for approval on
+            timeout_minutes: Total timeout (default 24 hours)
+            poll_interval: Normal poll interval in seconds (default 5 min)
+            response_types: Optional list of response types to filter for
+            fast_poll_interval: Fast poll interval in seconds (default 15s)
+            fast_poll_duration: Duration to use fast polling in seconds (default 10 min)
+            after_timestamp: Only consider approvals created after this ISO timestamp
+            require_new: If True, only look for approvals created after we start waiting
+
+        Returns:
+            Approval dict if received, None if timeout
+        """
         start_time = time.time()
         timeout_seconds = timeout_minutes * 60
 
-        logger.info(f"Waiting for approval on strategy {strategy_id} (timeout: {timeout_minutes} min)")
+        # Only filter by timestamp if explicitly requested (for merge approval flow)
+        # For initial approval, we want to find ANY approval for this strategy
+        if require_new and after_timestamp is None:
+            after_timestamp = datetime.utcnow().isoformat()
+
+        logger.info(f"Waiting for approval on strategy {strategy_id} "
+                    f"(fast poll: {fast_poll_interval}s for {fast_poll_duration}s, then {poll_interval}s)")
 
         while time.time() - start_time < timeout_seconds:
-            approval = self.get_approval(strategy_id)
-            if approval:
-                logger.info(f"Approval received for strategy {strategy_id}: {approval['response_type']}")
-                return approval
+            approval = self.get_approval(strategy_id, after_timestamp=after_timestamp)
 
-            time.sleep(poll_interval)
+            if approval:
+                # If filtering by response types, check if this matches
+                if response_types and approval.get('response_type') not in response_types:
+                    # Got a response but not the type we're waiting for, keep polling
+                    pass
+                else:
+                    logger.info(f"Approval received for strategy {strategy_id}: {approval['response_type']}")
+                    return approval
+
+            # Adaptive polling: fast for first N seconds, then slow
+            elapsed = time.time() - start_time
+            if elapsed < fast_poll_duration:
+                current_interval = fast_poll_interval
+            else:
+                current_interval = poll_interval
+
+            time.sleep(current_interval)
 
         logger.warning(f"Approval timeout for strategy {strategy_id}")
         return None

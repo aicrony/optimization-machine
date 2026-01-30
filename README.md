@@ -2,6 +2,24 @@
 
 An autonomous self-optimizing system for Gentube.ai that strategizes improvements, proposes changes via mobile, gets approval, deploys changes, collects data, analyzes results, and iterates.
 
+## Quick Start
+
+```bash
+source venv/bin/activate
+```
+
+```bash
+pip install -r requirements.txt
+```
+
+```bash
+python main.py run --days 1
+```
+
+```bash
+python main.py run
+```
+
 ## Overview
 
 The Optimization Machine is designed to help Gentube.ai achieve incremental improvements (5-20% lifts) in key metrics like DAU, ARPU, and retention to reach $10k MRR through automated, data-driven optimization cycles.
@@ -81,28 +99,98 @@ python main.py continuous
 
 ## Usage
 
-### Commands
+### CLI Commands
 
 ```bash
-# Run a single optimization cycle
+# Run continuous optimization loop (default: forever)
 python main.py run
 
-# Run continuous optimization (every 12 hours)
-python main.py continuous
+# Run for a specific duration
+python main.py run --days 7
+python main.py run --days 0.5        # 12 hours
 
-# Run Telegram bot only (for testing)
+# Alias for 'run'
+python main.py continuous
+python main.py continuous --days 30
+
+# Run Telegram bot only (for testing connectivity)
 python main.py bot
 
-# Check system health
+# Check system health (database, alerts, components)
 python main.py health
 
-# Show statistics
+# Show system statistics (pending strategies, latest metrics, alerts)
 python main.py stats
 
-# Export metrics
-python main.py export --format json
+# Export metrics to file
+python main.py export                # JSON (default)
 python main.py export --format csv
+
+# Backfill dependency analysis for existing strategies
+python main.py backfill-deps
 ```
+
+### Telegram Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Initialize the bot and show welcome message |
+| `/help` | Show all available commands and response options |
+| `/status` | Check current system status |
+| `/ping` | Test bot connectivity |
+| `/saved` | View saved and pending strategies (tap ID to review) |
+| `/failed` | View failed strategies (tap ID to re-save) |
+| `/rejected` | View rejected strategies (tap ID to re-save) |
+| `/approved` | View approved strategies (tap ID to execute) |
+| `/restart` | Return to main menu or trigger a new optimization cycle |
+| `/resume` | View and resume stuck strategies |
+
+### Telegram Inline Buttons
+
+When viewing a strategy:
+
+| Button | Action |
+|--------|--------|
+| **Save** | Save strategy for manual implementation later |
+| **Exec** | Approve and auto-implement (code generation + deploy to preview) |
+| **Reject** | Discard the strategy |
+| **Split into N strategies** | Split a multi-change strategy into individual single-change strategies |
+
+When reviewing a preview deployment:
+
+| Button | Action |
+|--------|--------|
+| **Merge** | Merge feature branch to develop |
+| **Discard** | Delete the feature branch |
+| **Defer** | Keep preview active for later review |
+
+When a build fails:
+
+| Button | Action |
+|--------|--------|
+| **Save** | Save strategy for later |
+| **Fail** | Mark as failed |
+| **Reject** | Reject the strategy |
+| **Continue (Q&A)** | Enter interactive troubleshooting session |
+| **Commit & Save** | Commit partial code and save strategy |
+
+During interactive troubleshooting (Q&A):
+
+| Button | Action |
+|--------|--------|
+| **Try Fix** | Generate a fix based on the conversation |
+| **Give Up** | Skip the error and move on |
+
+For stuck strategies (`/resume`):
+
+| Button | Action |
+|--------|--------|
+| **Resume** | Continue from where it left off (uses cached code) |
+| **Regenerate** | Delete code cache and start fresh |
+
+### Text Responses
+
+When a strategy is pending, you can also reply with free text to refine it. The system will generate a revised strategy incorporating your feedback.
 
 ### Optimization Cycle Flow
 
@@ -122,12 +210,10 @@ When a strategy is proposed, you'll receive a Telegram message with:
 - **Summary**: Brief description of the strategy
 - **Expected Impact**: Projected metric improvements
 - **Changes**: List of specific modifications
-- **Buttons**: "Approve" or "Reject"
+- **Dependency Analysis**: How changes relate to each other and whether they can be split
+- **Buttons**: Save, Exec, Reject, and Split (for multi-change strategies)
 
-You can also reply with text:
-- `approve` - Approve the strategy
-- `reject` - Reject the strategy
-- `tweak: <suggestion>` - Request modifications
+You can reply with free text to refine the strategy (up to 3 refinements per cycle).
 
 ## Configuration
 
@@ -175,6 +261,7 @@ MAX_METRIC_DROP_PERCENT=20
 ## Metrics Tracked
 
 ### Primary KPIs
+
 - **DAU**: Daily Active Users
 - **MAU**: Monthly Active Users
 - **ARPU**: Average Revenue Per User
@@ -183,12 +270,14 @@ MAX_METRIC_DROP_PERCENT=20
 - **MRR**: Monthly Recurring Revenue
 
 ### Product Metrics
+
 - **Generation Success Rate**: % of successful AI generations
 - **Credit Usage**: Total credits consumed
 - **Average Session Iterations**: Avg generations per session
 - **Payment Success Rate**: % of successful charges
 
 ### User Feedback
+
 - Sentiment analysis (positive/negative/neutral)
 - Categorization (quality, performance, UI/UX, pricing, features, bugs)
 - Ratings (1-5 stars)
@@ -212,17 +301,21 @@ pytest --cov=. --cov-report=html
 
 ```
 optimization-machine/
-├── config.env              # Environment configuration
+├── config.env              # Environment configuration (not committed)
+├── config.env.example      # Template for config.env
 ├── requirements.txt        # Python dependencies
 ├── schema.sql             # Database schema
-├── main.py                # Entry point
-├── strategy_engine.py     # AI strategy generation
-├── db_handler.py          # Database operations
-├── mobile_interface.py    # Telegram bot
-├── execution_agent.py     # Change deployment
-├── data_collector.py      # Metrics collection
-├── loop_controller.py     # Cycle orchestration
-├── safety_net.py          # Safety & monitoring
+├── main.py                # Entry point and CLI
+├── strategy_engine.py     # AI strategy generation + dependency analysis
+├── db_handler.py          # Database operations (Supabase)
+├── mobile_interface.py    # Telegram bot for CEO interaction
+├── execution_agent.py     # Code generation + build + deploy
+├── data_collector.py      # Metrics collection (Stripe, GA4, CrUX)
+├── loop_controller.py     # Cycle orchestration (7-stage pipeline)
+├── safety_net.py          # Validation & monitoring
+├── troubleshooter.py      # Interactive Q&A troubleshooting for build failures
+├── code_cache.py          # Code generation cache for resume capability
+├── credentials/           # Service account keys (not committed)
 ├── logs/                  # Log files
 └── tests/                 # Unit tests
     ├── test_strategy_engine.py
@@ -244,21 +337,25 @@ optimization-machine/
 ### Common Issues
 
 **Issue**: Telegram bot not receiving messages
+
 - Check `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
 - Run `python main.py bot` to test bot connection
 - Use `/start` command to verify bot is working
 
 **Issue**: Database connection failed
+
 - Verify `SUPABASE_URL` and `SUPABASE_KEY`
 - Check Supabase project is active
 - Ensure schema.sql has been run
 
 **Issue**: Strategy generation failed
+
 - Verify `ANTHROPIC_API_KEY` is valid
 - Check API quotas and limits
 - Review logs for specific error messages
 
 **Issue**: Metrics collection failed
+
 - Verify `STRIPE_API_KEY` if using Stripe
 - Check Gentube app API endpoint configuration
 - Ensure data collection wait time is appropriate
@@ -284,6 +381,7 @@ Proprietary - Internal use only
 ## Support
 
 For questions or issues:
+
 - Check logs in `logs/` directory
 - Run `python main.py health` for system status
 - Run `python main.py stats` for current metrics

@@ -36,7 +36,7 @@ pip install -r requirements.txt
 2. Create a new account or sign in
 3. Click "New Project"
 4. Fill in project details:
-   - Name: `gentube-optimizer`
+   - Name: `OM-v1`
    - Database Password: (save this securely)
    - Region: Choose closest to you
 5. Wait for project to be ready (~2 minutes)
@@ -51,6 +51,7 @@ pip install -r requirements.txt
 6. Verify tables were created in **Table Editor**
 
 You should see these tables:
+
 - strategies
 - approvals
 - metrics
@@ -61,11 +62,12 @@ You should see these tables:
 
 #### 2.3 Get API Credentials
 
-1. Go to **Settings** → **API**
+1. Go to **Project Settings** → **Data API**
 2. Copy:
    - **Project URL** (e.g., `https://xxxxx.supabase.co`)
-   - **anon/public key** (starts with `eyJ...`)
-3. Save these for the next step
+3. Go to **Project Settings** → **API Keys**
+   - **Secret Keys** (starts with `sb_secret_...`)
+4. Save these for the next step
 
 ### 3. Anthropic API Setup
 
@@ -109,6 +111,7 @@ You should see these tables:
 5. Copy the chat ID number
 
 **Alternative method using a helper bot:**
+
 1. Search for `@userinfobot` in Telegram
 2. Send any message to it
 3. It will reply with your user ID
@@ -140,7 +143,80 @@ You should see these tables:
 2. Go to **Settings** → **General**
 3. Copy the "Project ID"
 
-### 7. Configure Environment
+### 7. Google Analytics 4 Setup (Recommended)
+
+This enables the optimizer to analyze user behavior, traffic sources, and conversion funnels.
+
+#### 7.1 Create Google Cloud Project
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. Create a new project or select an existing one
+3. Note your project ID
+
+#### 7.2 Enable Google Analytics Data API
+
+1. In Google Cloud Console, go to **APIs & Services** → **Library**
+2. Search for "Google Analytics Data API"
+3. Click **Enable**
+
+#### 7.3 Create Service Account
+
+1. Go to **APIs & Services** → **Credentials**
+2. Click **Create Credentials** → **Service Account**
+3. Name it "gentube-optimizer"
+4. Click **Create and Continue**
+5. Skip the optional roles (we'll add GA4 access separately)
+6. Click **Done**
+
+#### 7.4 Download JSON Key
+
+1. Click on the service account you just created
+2. Go to **Keys** tab
+3. Click **Add Key** → **Create new key**
+4. Select **JSON** format
+5. Click **Create**
+6. Save the downloaded file to `./credentials/ga4-service-account.json`
+
+#### 7.5 Add Service Account to GA4
+
+1. Go to [analytics.google.com](https://analytics.google.com)
+2. Select your Gentube property
+3. Go to **Admin** (gear icon) → **Property Access Management**
+4. Click **+** → **Add users**
+5. Enter the service account email (from the JSON file, looks like `gentube-optimizer@project-id.iam.gserviceaccount.com`)
+6. Set role to **Viewer**
+7. Click **Add**
+
+#### 7.6 Get GA4 Property ID
+
+1. In Google Analytics, go to **Admin** → **Property Settings**
+2. Copy the **Property ID** (a number like `123456789`)
+3. Format it as `properties/123456789` for the config
+
+### 8. Chrome UX Report (CrUX) API Setup (Recommended)
+
+This enables the optimizer to monitor Core Web Vitals (LCP, CLS, INP) using real user data.
+
+#### 8.1 Enable CrUX API
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. Select the same project used for GA4
+3. Go to **APIs & Services** → **Library**
+4. Search for "Chrome UX Report API"
+5. Click **Enable**
+
+#### 8.2 Create API Key
+
+1. Go to **APIs & Services** → **Credentials**
+2. Click **Create Credentials** → **API Key**
+3. Under **API restrictions**, select **Restrict key**
+4. Select only "Chrome UX Report API"
+5. Click **Create**
+6. Copy the generated API key
+
+**Note**: CrUX data is only available for origins with sufficient traffic (typically 1000+ daily visitors). If your site is new or has low traffic, CrUX will return "insufficient traffic" errors, which is handled gracefully.
+
+### 10. Configure Environment
 
 Create your configuration file:
 
@@ -169,6 +245,14 @@ STRIPE_API_KEY=sk_test_xxxxx...
 VERCEL_TOKEN=xxxxx...
 VERCEL_PROJECT_ID=prj_xxxxx...
 
+# Google Analytics 4 (Recommended)
+GA4_CREDENTIALS_PATH=./credentials/ga4-service-account.json
+GA4_PROPERTY_ID=properties/123456789
+
+# Chrome UX Report API (Recommended)
+CRUX_API_KEY=AIzaSy...your-api-key
+GENTUBE_ORIGIN=https://gentube.ai
+
 # Gentube App Configuration
 GENTUBE_APP_URL=https://gentube.vercel.app
 GENTUBE_API_ENDPOINT=https://gentube.vercel.app/api
@@ -186,41 +270,39 @@ MIN_APPROVAL_WAIT_MINUTES=5
 ROLLBACK_ENABLED=true
 ```
 
-### 8. Verify Setup
+### 11. Verify Setup
 
-Test each component individually:
-
-#### 8.1 Test Database Connection
-
-```bash
-python -c "from db_handler import get_db_handler; db = get_db_handler(); print('✅ Database connected')"
-```
-
-#### 8.2 Test Telegram Bot
-
-```bash
-python main.py bot
-```
-
-Then send `/start` to your bot in Telegram. You should see a welcome message.
-
-Press `Ctrl+C` to stop the bot.
-
-#### 8.3 Test Claude API
-
-```bash
-python -c "from strategy_engine import get_strategy_engine; engine = get_strategy_engine(); print('✅ Claude API connected')"
-```
-
-#### 8.4 Run Health Check
+Run the health check to verify all components are working:
 
 ```bash
 python main.py health
 ```
 
-Should show "Overall Status: HEALTHY"
+You should see output like:
 
-### 9. Initial Test Run
+```
+============================================================
+System Health Check
+============================================================
+
+Overall Status: HEALTHY
+Timestamp: 2026-01-27T05:50:58.646790
+
+Component Status:
+  • database: healthy
+  • alerts: healthy
+    Unacknowledged Alerts: 0
+```
+
+If you see "Overall Status: HEALTHY", your setup is complete.
+
+**Troubleshooting**: If any component shows as unhealthy, check:
+- Database issues: Verify `SUPABASE_URL` and `SUPABASE_KEY` in config.env
+- API issues: Verify `ANTHROPIC_API_KEY` is valid
+- Analytics issues: Check GA4 credentials path and property ID (optional)
+- CrUX issues: May show "insufficient_traffic" for new sites (this is normal)
+
+### 12. Initial Test Run
 
 Run your first optimization cycle in test mode:
 
@@ -229,15 +311,16 @@ python main.py run
 ```
 
 This will:
+
 1. Collect current metrics (may be empty initially)
 2. Generate a test strategy
 3. Send it to Telegram for approval
 4. Wait for your response
 5. Execute if approved
 
-### 10. Production Deployment
+### 13. Production Deployment
 
-#### 10.1 Set Production Environment
+#### 13.1 Set Production Environment
 
 Update `config.env`:
 
@@ -246,9 +329,9 @@ ENVIRONMENT=production
 LOG_LEVEL=WARNING
 ```
 
-#### 10.2 Run as Service (Linux/Mac)
+#### 13.2 Run as Service (Linux/Mac)
 
-Create a systemd service file `/etc/systemd/system/gentube-optimizer.service`:
+Create a systemd service file `/etc/systemd/system/OM-v1.service`:
 
 ```ini
 [Unit]
@@ -271,18 +354,18 @@ WantedBy=multi-user.target
 Enable and start:
 
 ```bash
-sudo systemctl enable gentube-optimizer
-sudo systemctl start gentube-optimizer
-sudo systemctl status gentube-optimizer
+sudo systemctl enable OM-v1
+sudo systemctl start OM-v1
+sudo systemctl status OM-v1
 ```
 
 View logs:
 
 ```bash
-sudo journalctl -u gentube-optimizer -f
+sudo journalctl -u OM-v1 -f
 ```
 
-#### 10.3 Run with nohup (Alternative)
+#### 13.3 Run with nohup (Alternative)
 
 ```bash
 nohup python main.py continuous > logs/output.log 2>&1 &
@@ -294,7 +377,7 @@ Stop with:
 pkill -f "main.py continuous"
 ```
 
-#### 10.4 Run with Docker (Alternative)
+#### 13.4 Run with Docker (Alternative)
 
 Create `Dockerfile`:
 
@@ -314,11 +397,11 @@ CMD ["python", "main.py", "continuous"]
 Build and run:
 
 ```bash
-docker build -t gentube-optimizer .
-docker run -d --name optimizer --env-file config.env gentube-optimizer
+docker build -t OM-v1 .
+docker run -d --name optimizer --env-file config.env OM-v1
 ```
 
-### 11. Monitoring and Maintenance
+### 14. Monitoring and Maintenance
 
 #### View Logs
 
@@ -354,7 +437,7 @@ python main.py export --format json
 3. Review **Database** → **Logs** for errors
 4. Monitor **Database** → **Usage** for quota
 
-### 12. Troubleshooting
+### 15. Troubleshooting
 
 #### Issue: "Module not found" error
 
@@ -395,7 +478,7 @@ curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getMe
 - Check Vercel credentials
 - Review execution logs
 
-### 13. Security Best Practices
+### 16. Security Best Practices
 
 1. **Never commit `config.env`** - it's in `.gitignore`
 2. **Use environment variables** in production, not files
@@ -409,7 +492,7 @@ curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getMe
 7. **Monitor for unauthorized access** in Supabase logs
 8. **Use Telegram bot in private chat** only
 
-### 14. Advanced Configuration
+### 17. Advanced Configuration
 
 #### Custom Metrics Collection
 
@@ -515,11 +598,18 @@ cp config.env.backup config.env
 - [ ] Telegram chat ID obtained
 - [ ] Stripe API key obtained (optional)
 - [ ] Vercel token obtained (optional)
+- [ ] Google Analytics 4 setup (recommended):
+  - [ ] Google Cloud project created
+  - [ ] Google Analytics Data API enabled
+  - [ ] Service account created
+  - [ ] JSON key downloaded to `./credentials/`
+  - [ ] Service account added to GA4 property
+  - [ ] GA4 Property ID obtained
+- [ ] Chrome UX Report API setup (recommended):
+  - [ ] CrUX API enabled in Google Cloud
+  - [ ] API key created
 - [ ] `config.env` configured
-- [ ] Database connection tested
-- [ ] Telegram bot tested
-- [ ] Claude API tested
-- [ ] Health check passed
-- [ ] Test cycle completed
+- [ ] Health check passed (`python main.py health`)
+- [ ] Test cycle completed (`python main.py run`)
 
 **You're ready to optimize! 🚀**

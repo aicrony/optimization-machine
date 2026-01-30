@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     priority INTEGER DEFAULT 0,
     focus_area VARCHAR(100),
     data_snapshot JSONB,
-    CONSTRAINT valid_status CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'analyzing', 'completed', 'failed'))
+    CONSTRAINT valid_status CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'analyzing', 'completed', 'failed', 'saved', 'preview', 'merged', 'merge_failed', 'discarded', 'max_refinements'))
 );
 
 -- Approvals Table
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     response_type VARCHAR(50),
     notes TEXT,
     approved_at TIMESTAMPTZ,
-    CONSTRAINT valid_response_type CHECK (response_type IN ('approve', 'reject', 'tweak'))
+    CONSTRAINT valid_response_type CHECK (response_type IN ('approve', 'reject', 'tweak', 'save', 'merge', 'discard', 'defer', 'qa_response', 'qa_try_fix', 'qa_give_up', 'build_save', 'build_fail', 'build_reject', 'build_continue', 'build_commit_save', 'manual_complete'))
 );
 
 -- Metrics Table
@@ -126,10 +126,10 @@ CREATE TRIGGER update_strategies_updated_at BEFORE UPDATE ON strategies
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Row Level Security (Optional - enable if needed)
--- ALTER TABLE strategies ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE metrics ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE feedback ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE deployments ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE cycle_logs ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE alerts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE strategies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE metrics ENABLE ROW LEVEL SECURITY;
+ALTER TABLE feedback ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deployments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cycle_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alerts ENABLE ROW LEVEL SECURITY;

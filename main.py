@@ -4,17 +4,22 @@ Gentube.ai Optimization Machine
 Main entry point
 
 Usage:
-    python main.py run          # Run a single optimization cycle
-    python main.py continuous   # Run continuous optimization loop
-    python main.py bot          # Run Telegram bot only (for testing)
-    python main.py health       # Check system health
-    python main.py export       # Export metrics
+    python main.py run                  # Run optimization loop forever (default)
+    python main.py run --days 7         # Run for 7 days then stop
+    python main.py continuous           # Same as 'run' (alias)
+    python main.py continuous --days 30 # Run for 30 days
+    python main.py bot                  # Run Telegram bot only (for testing)
+    python main.py health               # Check system health
+    python main.py export               # Export metrics
+    python main.py backfill-deps        # Backfill dependency analysis for existing strategies
 """
 
 import os
 import sys
 import argparse
 import logging
+import threading
+import asyncio
 from dotenv import load_dotenv
 
 # Load environment before imports
@@ -37,12 +42,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global reference to bot thread for cleanup
+_bot_thread = None
+_bot_stop_event = None
+
+
+def start_bot_background():
+    """Start the Telegram bot in a background thread to receive messages"""
+    global _bot_thread, _bot_stop_event
+
+    def run_bot_thread():
+        try:
+            logger.info("Starting Telegram bot in background thread...")
+            bot = get_mobile_interface()
+            # Use in_thread=True to avoid signal handler issues in background threads
+            bot.run_polling(in_thread=True)
+        except Exception as e:
+            logger.error(f"Bot thread error: {e}", exc_info=True)
+
+    _bot_thread = threading.Thread(target=run_bot_thread, daemon=True)
+    _bot_thread.start()
+    logger.info("Telegram bot background thread started")
+
+
+def stop_bot_background():
+    """Stop the background bot thread"""
+    global _bot_thread
+    if _bot_thread and _bot_thread.is_alive():
+        logger.info("Stopping Telegram bot background thread...")
+        # The thread is daemon so it will stop when main exits
+
 
 def run_single_cycle():
     """Run a single optimization cycle"""
     logger.info("Running single optimization cycle...")
 
     try:
+        # Start Telegram bot in background to receive messages
+        start_bot_background()
+
+        # Give the bot a moment to initialize
+        import time
+        time.sleep(2)
+
         controller = get_loop_controller()
         result = controller.run_cycle()
 
@@ -72,19 +114,44 @@ def run_single_cycle():
         return 1
 
 
-def run_continuous():
-    """Run continuous optimization loop"""
+def run_continuous(days: float = None):
+    """
+    Run continuous optimization loop
+
+    Args:
+        days: Number of days to run (None = forever)
+    """
     logger.info("Starting continuous optimization mode...")
 
     try:
+        # Start Telegram bot in background to receive messages
+        start_bot_background()
+
+        # Give the bot a moment to initialize
+        import time
+        time.sleep(2)
+
+        # Calculate end time if days specified
+        end_time = None
+        if days is not None:
+            from datetime import datetime, timedelta
+            end_time = datetime.now() + timedelta(days=days)
+            duration_msg = f"Running for {days} day(s) (until {end_time.strftime('%Y-%m-%d %H:%M:%S')})"
+        else:
+            duration_msg = "Running forever (no time limit)"
+
+        logger.info(f"Run duration: {duration_msg}")
+
         print("\n" + "="*60)
         print("Gentube.ai Optimization Machine")
         print("Running in continuous mode")
+        print(f"Duration: {duration_msg}")
+        print("Telegram bot running in background")
         print("Press Ctrl+C to stop")
         print("="*60 + "\n")
 
         controller = get_loop_controller()
-        controller.run_continuous()
+        controller.run_continuous(end_time=end_time)
 
         return 0
 
@@ -232,6 +299,39 @@ def show_stats():
         return 1
 
 
+def backfill_deps():
+    """Backfill dependency analysis for existing strategies"""
+    logger.info("Backfilling dependency analysis...")
+
+    try:
+        from strategy_engine import get_strategy_engine
+
+        print("\n" + "="*60)
+        print("Backfilling Dependency Analysis")
+        print("="*60 + "\n")
+
+        engine = get_strategy_engine()
+        db = get_db_handler()
+        results = engine.backfill_dependency_analysis(db)
+
+        print(f"Updated: {results['updated']}")
+        print(f"Skipped: {results['skipped']}")
+        print(f"Failed: {results['failed']}")
+
+        if results['details']:
+            print("\nDetails:")
+            for detail in results['details']:
+                print(f"  {detail}")
+
+        print("\n")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Backfill failed: {e}", exc_info=True)
+        print(f"\n❌ Backfill failed: {e}\n")
+        return 1
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
@@ -241,7 +341,7 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['run', 'continuous', 'bot', 'health', 'export', 'stats'],
+        choices=['run', 'continuous', 'bot', 'health', 'export', 'stats', 'backfill-deps'],
         help='Command to execute'
     )
 
@@ -252,6 +352,13 @@ def main():
         help='Export format (for export command)'
     )
 
+    parser.add_argument(
+        '--days',
+        type=float,
+        default=None,
+        help='Number of days to run (for run/continuous commands). Default: run forever'
+    )
+
     args = parser.parse_args()
 
     # Create logs directory if it doesn't exist
@@ -259,9 +366,9 @@ def main():
 
     # Execute command
     if args.command == 'run':
-        return run_single_cycle()
+        return run_continuous(days=args.days)
     elif args.command == 'continuous':
-        return run_continuous()
+        return run_continuous(days=args.days)
     elif args.command == 'bot':
         return run_bot()
     elif args.command == 'health':
@@ -270,6 +377,8 @@ def main():
         return export_metrics(format=args.format)
     elif args.command == 'stats':
         return show_stats()
+    elif args.command == 'backfill-deps':
+        return backfill_deps()
     else:
         parser.print_help()
         return 1

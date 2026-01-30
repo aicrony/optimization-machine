@@ -65,3 +65,9 @@ htmlcov/
 tmp/
 temp/
 *.tmp
+
+# Credentials
+credentials/
+
+# Code Cache (generated code changes for resume capability)
+cache/

@@ -7,7 +7,12 @@ import os
 import logging
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
-from twilio.rest import Client as TwilioClient
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TwilioClient = None
+    TWILIO_AVAILABLE = False
 from dotenv import load_dotenv
 from db_handler import get_db_handler
 
@@ -37,17 +42,18 @@ class SafetyNet:
         self.twilio_client = None
         self.alert_phone = os.getenv('ALERT_PHONE_NUMBER')
 
-        try:
-            twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
-            twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
-            twilio_phone = os.getenv('TWILIO_PHONE_NUMBER')
+        if TWILIO_AVAILABLE:
+            try:
+                twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
+                twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
+                twilio_phone = os.getenv('TWILIO_PHONE_NUMBER')
 
-            if twilio_sid and twilio_token and twilio_phone:
-                self.twilio_client = TwilioClient(twilio_sid, twilio_token)
-                self.twilio_phone = twilio_phone
-                logger.info("Twilio SMS alerts initialized")
-        except Exception as e:
-            logger.warning(f"Twilio initialization failed: {e}")
+                if twilio_sid and twilio_token and twilio_phone:
+                    self.twilio_client = TwilioClient(twilio_sid, twilio_token)
+                    self.twilio_phone = twilio_phone
+                    logger.info("Twilio SMS alerts initialized")
+            except Exception as e:
+                logger.warning(f"Twilio initialization failed: {e}")
 
         logger.info("Safety net initialized")
 
