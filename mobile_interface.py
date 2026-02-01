@@ -271,6 +271,10 @@ class MobileInterface:
         self.app.add_handler(CallbackQueryHandler(self._handle_callback))
         logger.info("Callback query handler registered")
 
+        # Handler for numeric strategy shortcuts like /27
+        self.app.add_handler(MessageHandler(filters.Regex(r'^/\d+$'), self._handle_message))
+        logger.info("Numeric strategy shortcut handler registered")
+
         # Message handler for text responses (including replies)
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message))
         logger.info("Text message handler registered")
