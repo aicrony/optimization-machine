@@ -139,6 +139,13 @@ class DataCollector:
         else:
             logger.warning("GA4_PROPERTY_ID or credentials not set")
 
+        # Initialize Microsoft Clarity (Data Export API)
+        self.clarity_api_token = os.getenv('CLARITY_API_TOKEN')
+        if self.clarity_api_token:
+            logger.info("Microsoft Clarity Data Export API initialized")
+        else:
+            logger.warning("CLARITY_API_TOKEN not set - UX behavior analytics unavailable")
+
         # Initialize CrUX API
         self.crux_api_key = os.getenv('CRUX_API_KEY')
         self.gentube_origin = os.getenv('GENTUBE_ORIGIN', os.getenv('GENTUBE_APP_URL'))
@@ -180,6 +187,7 @@ class DataCollector:
             # Collect analytics and performance metrics
             metrics['google_analytics'] = self._collect_ga4_metrics()
             metrics['web_vitals'] = self._collect_crux_metrics()
+            metrics['clarity'] = self._collect_clarity_metrics()
 
             # Calculate derived metrics (includes new analytics-based calculations)
             metrics['calculated'] = self._calculate_derived_metrics(metrics)
@@ -208,6 +216,10 @@ class DataCollector:
                 'cls_p75': metrics['web_vitals'].get('cls', {}).get('p75'),
                 'inp_p75': metrics['web_vitals'].get('inp', {}).get('p75_ms'),
                 'core_web_vitals_passing': metrics['web_vitals'].get('core_web_vitals_passing'),
+                # Clarity UX behavior summary fields
+                'rage_clicks': metrics['clarity'].get('rage_clicks'),
+                'dead_clicks': metrics['clarity'].get('dead_clicks'),
+                'quick_backs': metrics['clarity'].get('quick_backs'),
                 # Derived analytics metrics
                 'engagement_rate': metrics['calculated'].get('engagement_rate'),
                 'performance_score': metrics['calculated'].get('performance_score'),
@@ -601,6 +613,192 @@ class DataCollector:
             return {'error': str(e)}
         except Exception as e:
             logger.error(f"CrUX metrics collection failed: {e}")
+            return {'error': str(e)}
+
+    def _collect_clarity_metrics(self) -> Dict[str, Any]:
+        """Collect UX behavior analytics from Microsoft Clarity Data Export API.
+
+        Note: The API allows max 10 requests per project per day and returns
+        data for the last 1-3 days only (numOfDays parameter).
+        Results are cached in the settings table and refreshed every 4 hours.
+        """
+        logger.info("Collecting Microsoft Clarity metrics...")
+
+        if not self.clarity_api_token:
+            return {'error': 'Microsoft Clarity not configured'}
+
+        # Check cache — only call API if data is older than 4 hours
+        try:
+            cached_raw = self.db.get_setting('clarity_cache')
+            if cached_raw:
+                cached = json.loads(cached_raw)
+                cached_ts = datetime.fromisoformat(cached['timestamp'])
+                age_hours = (datetime.utcnow() - cached_ts).total_seconds() / 3600
+                if age_hours < 4:
+                    logger.info(f"Using cached Clarity data ({age_hours:.1f}h old, refreshes at 4h)")
+                    return cached['data']
+                else:
+                    logger.info(f"Clarity cache expired ({age_hours:.1f}h old), fetching fresh data")
+        except Exception as e:
+            logger.debug(f"Clarity cache check failed (will fetch fresh): {e}")
+
+        try:
+            url = "https://www.clarity.ms/export-data/api/v1/project-live-insights"
+            headers = {
+                'Authorization': f'Bearer {self.clarity_api_token}',
+                'Content-Type': 'application/json',
+            }
+            params = {'numOfDays': '3'}
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            # The API returns a list of metric objects, each with a metricName
+            # and an information array. Aggregate across all entries.
+            result = {
+                'total_sessions': 0,
+                'distinct_users': 0,
+                'pages_per_session': 0,
+                'scroll_depth': 0,
+                'rage_clicks': 0,
+                'dead_clicks': 0,
+                'excessive_scrolling': 0,
+                'quick_backs': 0,
+                'js_errors': 0,
+                'period': 'Last3Days',
+            }
+
+            for metric_block in data:
+                name = metric_block.get('metricName', '')
+                info_list = metric_block.get('information', [])
+
+                if name == 'Traffic':
+                    for info in info_list:
+                        result['total_sessions'] += int(info.get('totalSessionCount', 0))
+                        result['distinct_users'] += int(info.get('distinctUserCount', 0))
+                        pps = info.get('pagesPerSessionPercentage', 0)
+                        if pps:
+                            result['pages_per_session'] = round(float(pps), 2)
+                elif name == 'ScrollDepth':
+                    for info in info_list:
+                        depth = info.get('averageScrollDepth', 0)
+                        if depth:
+                            result['scroll_depth'] = round(float(depth), 2)
+                elif name == 'RageClickCount':
+                    for info in info_list:
+                        result['rage_clicks'] += int(info.get('subTotal', 0))
+                elif name == 'DeadClickCount':
+                    for info in info_list:
+                        result['dead_clicks'] += int(info.get('subTotal', 0))
+                elif name == 'ExcessiveScroll':
+                    for info in info_list:
+                        result['excessive_scrolling'] += int(info.get('subTotal', 0))
+                elif name == 'QuickbackClick':
+                    for info in info_list:
+                        result['quick_backs'] += int(info.get('subTotal', 0))
+                elif name == 'ScriptErrorCount':
+                    for info in info_list:
+                        result['js_errors'] += int(info.get('subTotal', 0))
+                elif name == 'EngagementTime':
+                    for info in info_list:
+                        active = info.get('activeTime', 0)
+                        if active:
+                            result['active_duration_avg'] = round(float(active), 2)
+
+            logger.info(f"Clarity metrics collected: {result['total_sessions']} sessions, "
+                        f"{result['rage_clicks']} rage clicks, {result['dead_clicks']} dead clicks")
+
+            # Second request: per-page breakdown of UX issues (uses 1 additional API call)
+            try:
+                url_params = {'numOfDays': '3', 'dimension1': 'URL'}
+                url_response = requests.get(url, headers=headers, params=url_params, timeout=30)
+                url_response.raise_for_status()
+                url_data = url_response.json()
+
+                # Collect per-page UX issues, keeping only pages with non-zero counts
+                ux_metrics = ['DeadClickCount', 'RageClickCount', 'QuickbackClick']
+                page_issues = {}  # url -> {metric: count}
+
+                for metric_block in url_data:
+                    name = metric_block.get('metricName', '')
+                    if name not in ux_metrics:
+                        continue
+                    for info in metric_block.get('information', []):
+                        count = int(info.get('subTotal', 0))
+                        if count == 0:
+                            continue
+                        page_url = info.get('Url', '')
+                        if not page_url:
+                            continue
+                        # Strip origin to keep just the path
+                        from urllib.parse import urlparse
+                        path = urlparse(page_url).path or '/'
+                        # Remove query strings for cleaner grouping
+                        if path not in page_issues:
+                            page_issues[path] = {}
+                        page_issues[path][name] = page_issues[path].get(name, 0) + count
+
+                # Sort by total issues descending, keep top 10
+                sorted_pages = sorted(
+                    page_issues.items(),
+                    key=lambda x: sum(x[1].values()),
+                    reverse=True
+                )[:10]
+
+                result['page_issues'] = [
+                    {
+                        'path': path,
+                        'dead_clicks': counts.get('DeadClickCount', 0),
+                        'rage_clicks': counts.get('RageClickCount', 0),
+                        'quick_backs': counts.get('QuickbackClick', 0),
+                    }
+                    for path, counts in sorted_pages
+                ]
+
+                logger.info(f"Clarity page breakdown: {len(result['page_issues'])} pages with UX issues")
+
+            except Exception as e:
+                logger.warning(f"Clarity per-page breakdown failed (non-critical): {e}")
+                result['page_issues'] = []
+
+            # Cache the result ONLY if new data looks valid (don't overwrite good cache with bad data)
+            if result.get('total_sessions', 0) > 0 or result.get('dead_clicks', 0) > 0 or result.get('rage_clicks', 0) > 0:
+                try:
+                    cache_payload = json.dumps({
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'data': result
+                    })
+                    self.db.set_setting('clarity_cache', cache_payload)
+                    logger.info("Clarity data cached to database (validated: has meaningful data)")
+                except Exception as e:
+                    logger.warning(f"Failed to cache Clarity data (non-critical): {e}")
+            else:
+                logger.warning("Clarity API returned empty data — keeping existing cache intact")
+
+            return result
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Clarity API request failed: {e}")
+            # Fall back to stale cache rather than returning nothing
+            try:
+                cached_raw = self.db.get_setting('clarity_cache')
+                if cached_raw:
+                    cached = json.loads(cached_raw)
+                    logger.info("Returning stale Clarity cache after API failure")
+                    return cached['data']
+            except Exception:
+                pass
+            return {'error': str(e)}
+        except Exception as e:
+            logger.error(f"Clarity metrics collection failed: {e}")
+            try:
+                cached_raw = self.db.get_setting('clarity_cache')
+                if cached_raw:
+                    cached = json.loads(cached_raw)
+                    logger.info("Returning stale Clarity cache after collection failure")
+                    return cached['data']
+            except Exception:
+                pass
             return {'error': str(e)}
 
     def _collect_datastore_activity(self, days: int = 30) -> Dict[str, Any]:

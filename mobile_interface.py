@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from db_handler import get_db_handler
 from code_cache import get_code_cache
 from strategy_engine import get_strategy_engine
+from data_collector import DataCollector
 
 # Load environment variables
 load_dotenv('config.env')
@@ -40,6 +41,7 @@ class MobileInterface:
 
         self.app = Application.builder().token(self.token).build()
         self.db = get_db_handler()
+        self.company_name = os.getenv('COMPANY_NAME', 'Gentube.ai')
 
         # Create a separate Bot instance for sending messages from the main thread
         # This avoids event loop conflicts when the Application is running in a background thread
@@ -64,6 +66,21 @@ class MobileInterface:
         # State for interactive Q&A troubleshooting sessions
         # Maps chat_id -> strategy_id when a troubleshooting session is active
         self._qa_session_active = {}
+
+        # State for refinement sessions
+        # Maps chat_id -> strategy_id when waiting for refinement text
+        self._refine_session_active = {}
+
+        # State for "Run as New Strategy" button context
+        # Maps context_id (str) -> message text that should seed the new strategy
+        self._strategy_context_messages = {}
+        self._strategy_context_counter = 0
+
+        # Context message to inject into the next strategy generation cycle
+        self._strategy_generation_context = None
+
+        # Track last conversational chat message per chat_id (for resend after provider switch)
+        self._last_chat_message = {}
 
         # Setup handlers
         self._setup_handlers()
@@ -112,6 +129,45 @@ class MobileInterface:
         if current:
             chunks.append(current)
         return chunks
+
+    def _extract_action_buttons(self, response: str, ctx_id: str) -> list:
+        """Parse LLM response for strategy references and return dynamic inline buttons.
+
+        Scans for #N patterns to create View buttons for each mentioned strategy,
+        plus Approve buttons and navigation buttons when those actions are mentioned.
+        Returns a list of button rows (each row is a list of InlineKeyboardButton).
+        """
+        import re
+        buttons = []
+        seen = set()
+
+        response_lower = response.lower()
+
+        # Find all strategy IDs mentioned (e.g. "#25", "#26")
+        strategy_ids = sorted(set(re.findall(r'#(\d+)', response)))
+
+        for sid in strategy_ids:
+            # Check if "approve" is mentioned near this strategy ID
+            if re.search(rf'approve.*?#?{sid}|#{sid}.*?approve', response_lower):
+                cb = f'exec:{sid}'
+                if cb not in seen:
+                    buttons.append([InlineKeyboardButton(f'🚀 Approve #{sid}', callback_data=cb)])
+                    seen.add(cb)
+
+            # Always add a View button for each mentioned strategy
+            cb = f'pick:saved:{sid}'
+            if cb not in seen:
+                buttons.append([InlineKeyboardButton(f'🔍 View #{sid}', callback_data=cb)])
+                seen.add(cb)
+
+        # Navigation: "saved strategies" or /saved
+        if re.search(r'saved.*?strateg|/saved', response_lower):
+            buttons.append([InlineKeyboardButton('📋 View Saved Strategies', callback_data='menu:saved')])
+
+        # Always include "Run as New Strategy"
+        buttons.append([InlineKeyboardButton('🚀 Run as New Strategy', callback_data=f'run_as_strategy:{ctx_id}')])
+
+        return buttons
 
     async def _send_chunked(self, bot, chat_id: int, text: str, reply_markup=None):
         """Send a long message as multiple chunks, with reply_markup only on the last one."""
@@ -208,7 +264,8 @@ class MobileInterface:
         self.app.add_handler(CommandHandler("approved", self._approved_command))
         self.app.add_handler(CommandHandler("restart", self._restart_command))
         self.app.add_handler(CommandHandler("resume", self._resume_command))
-        logger.info("Command handlers registered: /start, /help, /status, /ping, /saved, /failed, /rejected, /approved, /restart, /resume")
+        self.app.add_handler(CommandHandler("llm", self._llm_command))
+        logger.info("Command handlers registered: /start, /help, /status, /ping, /saved, /failed, /rejected, /approved, /restart (alias), /resume, /llm")
 
         # Callback handlers for inline buttons
         self.app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -221,47 +278,73 @@ class MobileInterface:
         logger.info("All handlers setup complete")
 
     async def _start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        welcome_msg = """
-🤖 **Gentube.ai Optimization Bot**
+        """Handle /start command - show the landing menu"""
+        chat_id = update.message.chat_id
+        logger.info(f"/start received from chat_id: {chat_id}")
 
-I'll send you optimization strategies for approval.
+        # Clear any selection state and chat history, then show the landing menu
+        self.clear_menu_selection(chat_id)
+        self._saved_selection_state.pop(chat_id, None)
+        self._failed_selection_state.pop(chat_id, None)
+        self._rejected_selection_state.pop(chat_id, None)
+        self._approved_selection_state.pop(chat_id, None)
+        self.db.clear_chat_history(str(chat_id))
+
+        await self._send_landing_menu_inline(update)
+
+    async def _llm_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /llm command - show LLM provider selection"""
+        engine = get_strategy_engine()
+        current_provider = engine.llm_provider
+        providers = engine.available_providers
+
+        buttons = []
+        for p in providers:
+            label = f"✅ {p}" if p == current_provider else p
+            buttons.append([InlineKeyboardButton(label, callback_data=f"llm_provider:{p}")])
+
+        await update.message.reply_text(
+            f"🧠 **LLM Provider**\nCurrent: **{current_provider}**\n\nSelect a provider:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    async def _help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /help command"""
+        help_msg = f"""
+🤖 **{self.company_name} Optimization Bot**
 
 **Commands:**
+/start - Main menu / generate new strategy
 /help - Show this help message
 /status - Check system status
 /saved - View saved & pending strategies
 /failed - View failed strategies (re-save)
 /rejected - View rejected strategies (re-save)
 /approved - View approved strategies (ready to execute)
-/restart - Generate a new strategy
+/resume - Resume stuck strategies
+/llm - Switch LLM provider
 /ping - Test bot connectivity
 
 **How to respond to strategies:**
 - 📋 **Save** - Save for manual implementation later
-- 🚀 **Exec** - Auto-implement and deploy to preview
+- 📝 **Plan** - Generate an implementation plan (MD file) for human-led coding
+- 🚀 **Code** - Autonomous coding: generates plan, code, and deploys to preview
+- ✏️ **Refine** - Submit refinement feedback
 - ❌ **Reject** - Discard the strategy
-- **Any other reply** = refine the strategy
 
 **Text shortcuts:**
 - `save` / `later` / `manual` → Save for later
-- `exec` / `deploy` / `ship it` → Auto-execute
+- `plan` → Generate plan only
+- `code` / `deploy` / `ship it` → Autonomous code generation
 - `reject` / `no` / `skip` → Reject
 
 **After preview deployment:**
 - ✅ **Merge to develop** - Deploy to production
 - 🗑️ **Discard** - Delete the preview branch
 
-**Refinement examples:**
-- "Focus on retention instead"
-- "Only low-risk changes"
-- "Add A/B testing"
+Or just send me a message — I can answer questions about your data and strategies.
 """
-        await update.message.reply_text(welcome_msg)
-
-    async def _help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
-        await self._start_command(update, context)
+        await update.message.reply_text(help_msg)
 
     async def _status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
@@ -553,19 +636,8 @@ System: Running ✅
             await update.message.reply_text("❌ Error fetching approved strategies")
 
     async def _restart_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /restart command - show the landing menu again"""
-        chat_id = update.message.chat_id
-        logger.info(f"/restart received from chat_id: {chat_id}")
-
-        # Clear any selection state and show the landing menu
-        self.clear_menu_selection(chat_id)
-        self._saved_selection_state.pop(chat_id, None)
-        self._failed_selection_state.pop(chat_id, None)
-        self._rejected_selection_state.pop(chat_id, None)
-        self._approved_selection_state.pop(chat_id, None)
-
-        await update.message.reply_text("🔄 **Returning to main menu...**")
-        await self._send_landing_menu_inline(update)
+        """Handle /restart command - legacy alias for /start"""
+        await self._start_command(update, context)
 
     async def _handle_approved_selection(self, update: Update, strategy_id: int):
         """Handle when user selects an approved strategy by ID to execute"""
@@ -650,18 +722,25 @@ System: Running ✅
             keyboard = [
                 [
                     InlineKeyboardButton("📋 Save", callback_data=f"save:{strategy_id}"),
-                    InlineKeyboardButton("🚀 Exec", callback_data=f"exec:{strategy_id}"),
+                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
+                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
                 ],
-                [InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}")],
+                [
+                    InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
+                ],
                 [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")]
             ]
             if len(changes) > 1:
                 keyboard.append([InlineKeyboardButton(f"✂️ Split into {len(changes)} strategies", callback_data=f"split:{strategy_id}")])
-            message += "\n_Or reply with text to refine this strategy._"
         else:
             keyboard = [
                 [
-                    InlineKeyboardButton("🚀 Exec", callback_data=f"exec:{strategy_id}"),
+                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
+                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
+                ],
+                [
+                    InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
                     InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
                 ],
                 [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")]
@@ -723,6 +802,8 @@ System: Running ✅
 {changes_text}
 {dep_text}
 
+💾 **Cache:** Code plans and code changes are saved in the `cache/` folder on the executing machine (`cache/code_plans/` and `cache/code_changes/`).
+
 **Re-approve this strategy?**
 """
         keyboard = [
@@ -730,7 +811,10 @@ System: Running ✅
                 InlineKeyboardButton("📋 Save", callback_data=f"reapprove_save:{strategy_id}"),
                 InlineKeyboardButton("🗑️ Keep Rejected", callback_data=f"keep_rejected:{strategy_id}")
             ],
-            [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")]
+            [
+                InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete:{strategy_id}")
+            ]
         ]
         bot = query.get_bot()
         await bot.send_message(chat_id=chat_id, text=message, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -781,13 +865,15 @@ System: Running ✅
 """
         keyboard = [
             [
-                InlineKeyboardButton("🚀 Exec", callback_data=f"exec:{strategy_id}"),
+                InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
+                InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
                 InlineKeyboardButton("📋 Save", callback_data=f"save:{strategy_id}"),
             ],
             [
+                InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
                 InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
-                InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}"),
             ],
+            [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")],
         ]
         if len(changes) > 1:
             keyboard.append([InlineKeyboardButton(f"✂️ Split into {len(changes)} strategies", callback_data=f"split:{strategy_id}")])
@@ -795,6 +881,42 @@ System: Running ✅
         bot = query.get_bot()
         await self._send_chunked(bot, chat_id, message, reply_markup=InlineKeyboardMarkup(keyboard))
         logger.info(f"Displayed approved strategy {strategy_id} via pick button")
+
+    async def send_welcome_intro(self, bot=None):
+        """Send the bot intro/commands message.
+
+        Args:
+            bot: Optional Bot instance to use. When called from a callback handler,
+                 pass query.get_bot() to avoid event-loop-closed errors with _sender_bot.
+        """
+        if not self.chat_id:
+            return
+        engine = get_strategy_engine()
+        current_provider = engine.llm_provider
+        welcome_msg = f"""
+🤖 **{self.company_name} Optimization Bot**
+
+🧠 **LLM Provider: {current_provider}** — /llm to change
+
+**Commands:**
+/start - Main menu / generate new strategy
+/help - Show help
+/status - Check system status
+/saved - View saved & pending strategies
+/failed - View failed strategies
+/rejected - View rejected strategies
+/approved - View approved strategies
+/resume - Resume stuck strategies
+/llm - Switch LLM provider
+/ping - Test connectivity
+
+**How to respond to strategies:**
+📋 Save | 📝 Plan | 🚀 Code | ❌ Reject | ✏️ Refine
+
+Or just chat with me — I understand the optimization system and your data.
+"""
+        send_bot = bot or self._sender_bot
+        await send_bot.send_message(chat_id=self.chat_id, text=welcome_msg)
 
     async def send_landing_menu(self) -> bool:
         """
@@ -816,8 +938,12 @@ System: Running ✅
             rejected_count = len(self.db.get_rejected_strategies())
             approved_count = len(self.db.get_approved_strategies())
 
+            engine = get_strategy_engine()
+            current_provider = engine.llm_provider
+
             message = f"""
 🎯 **Optimization Loop Ready**
+🧠 LLM Provider: **{current_provider}** — /llm to change
 
 **Current Strategies:**
 • 📋 Saved/Pending: {saved_count + pending_count}
@@ -875,6 +1001,12 @@ System: Running ✅
         """Clear the landing menu selection for a chat"""
         self._landing_menu_selection.pop(chat_id, None)
 
+    def get_strategy_generation_context(self) -> str:
+        """Get and clear the context message for strategy generation (from 'Run as New Strategy' button)."""
+        context = self._strategy_generation_context
+        self._strategy_generation_context = None
+        return context
+
     async def _send_landing_menu_with_bot(self, chat_id: int, bot):
         """Send the landing menu using provided bot"""
         try:
@@ -885,8 +1017,12 @@ System: Running ✅
             rejected_count = len(self.db.get_rejected_strategies())
             approved_count = len(self.db.get_approved_strategies())
 
+            engine = get_strategy_engine()
+            current_provider = engine.llm_provider
+
             message = f"""
 🎯 **Optimization Loop Ready**
+🧠 LLM Provider: **{current_provider}** — /llm to change
 
 **Current Strategies:**
 • 📋 Saved/Pending: {saved_count + pending_count}
@@ -934,8 +1070,12 @@ System: Running ✅
             rejected_count = len(self.db.get_rejected_strategies())
             approved_count = len(self.db.get_approved_strategies())
 
+            engine = get_strategy_engine()
+            current_provider = engine.llm_provider
+
             message = f"""
 🎯 **Optimization Loop Ready**
+🧠 LLM Provider: **{current_provider}** — /llm to change
 
 **Current Strategies:**
 • 📋 Saved/Pending: {saved_count + pending_count}
@@ -1220,7 +1360,8 @@ System: Running ✅
             keyboard = [
                 [
                     InlineKeyboardButton("📋 Save", callback_data=f"save:{strategy_id}"),
-                    InlineKeyboardButton("🚀 Exec", callback_data=f"exec:{strategy_id}"),
+                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
+                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
                 ],
                 [
                     InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}")
@@ -1233,7 +1374,8 @@ System: Running ✅
         else:
             keyboard = [
                 [
-                    InlineKeyboardButton("🚀 Exec", callback_data=f"exec:{strategy_id}"),
+                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
+                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
                     InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
                 ],
                 [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")]
@@ -1430,6 +1572,88 @@ System: Running ✅
                 logger.info(f"Landing menu selection: {menu_action} from chat {chat_id}")
                 return  # Early return - menu handled
 
+            # Handle "Run as New Strategy" button from chat messages
+            if action == 'run_as_strategy':
+                ctx_id = parts[1]
+                context_message = self._strategy_context_messages.get(ctx_id, '')
+                if not context_message:
+                    await query.answer("Message context not found. Please try again.")
+                    return
+
+                # Store the context and immediately trigger strategy generation
+                self._strategy_generation_context = context_message
+                self._landing_menu_selection[chat_id] = 'restart'
+
+                await query.edit_message_text(
+                    f"🚀 **Generating New Strategy...**\n\n"
+                    f"Using the above message as context. Processing will begin shortly..."
+                )
+
+                logger.info(f"Run as New Strategy triggered from chat {chat_id} with context_id {ctx_id}")
+                return  # Early return
+
+            # Handle LLM provider selection
+            if action == 'llm_provider':
+                selected_provider = parts[1]
+                bot = query.get_bot()
+                try:
+                    engine = get_strategy_engine()
+                    engine.set_llm_provider(selected_provider)
+                    self.db.set_setting('llm_provider', selected_provider)
+
+                    await query.edit_message_text(
+                        f"🧠 **LLM Provider switched to: {selected_provider}**"
+                    )
+
+                    # Resend last conversational message if one exists
+                    last_msg = self._last_chat_message.get(chat_id)
+                    if last_msg:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🔄 Re-processing your last message with **{selected_provider}**..."
+                        )
+                        # Build a minimal Update-like call to _handle_conversation
+                        chat_id_str = str(self.chat_id or chat_id)
+                        context_parts = []
+                        pending = self.db.get_pending_strategies()
+                        if pending:
+                            context_parts.append(f"Current pending strategy #{pending[0]['id']}: {pending[0]['summary']}")
+                        saved = self.db.get_saved_strategies()
+                        if saved:
+                            saved_ids = ', '.join(f"#{s['id']}" for s in saved[:5])
+                            context_parts.append(f"Saved strategies: {len(saved)} ({saved_ids})")
+                        ctx = "\n".join(context_parts) if context_parts else ""
+
+                        from data_collector import DataCollector
+                        collector = DataCollector()
+                        history_limit = engine.chat_history_limit * 2
+                        chat_history = self.db.get_chat_history(chat_id_str, limit=history_limit)
+
+                        response = engine.chat(
+                            last_msg, context=ctx, db=self.db, collector=collector,
+                            chat_history=chat_history
+                        )
+
+                        self.db.log_chat_message(chat_id_str, 'user', last_msg)
+                        self.db.log_chat_message(chat_id_str, 'assistant', response)
+
+                        self._strategy_context_counter += 1
+                        ctx_id = str(self._strategy_context_counter)
+                        self._strategy_context_messages[ctx_id] = response
+
+                        run_as_strategy_markup = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🚀 Run as New Strategy", callback_data=f"run_as_strategy:{ctx_id}")]
+                        ])
+                        await self._send_chunked(bot, chat_id, response, reply_markup=run_as_strategy_markup)
+                    else:
+                        # No prior chat message — send welcome intro and landing menu
+                        await self.send_welcome_intro(bot=bot)
+                        await self._send_landing_menu_with_bot(chat_id, bot)
+                except Exception as e:
+                    logger.error(f"LLM provider switch failed: {e}", exc_info=True)
+                    await bot.send_message(chat_id=chat_id, text=f"⚠️ Failed to switch provider: {e}")
+                return  # Early return
+
             # Handle strategy ID picker buttons (pick:{context}:{strategy_id})
             if action == 'pick':
                 pick_context = parts[1]
@@ -1481,13 +1705,158 @@ System: Running ✅
                 bot = query.get_bot()
                 await self._send_landing_menu_with_bot(chat_id, bot)
 
+            elif action == 'plan':
+                # Generate plan only (no autonomous code execution)
+                response_type = 'plan'
+                response_text = 'Plan requested'
+                status = 'saved'
+                bot = query.get_bot()
+                await query.edit_message_text(
+                    f"📝 Strategy {strategy_id} — plan requested.\n\n{query.message.text}"
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏳ Generating implementation plan for Strategy #{strategy_id}... this may take a moment."
+                )
+                # Generate and save the plan
+                try:
+                    from pathlib import Path
+                    import json as _json
+                    strategy = self.db.get_strategy(strategy_id)
+                    if strategy:
+                        changes = strategy.get('changes', [])
+                        if isinstance(changes, str):
+                            changes = _json.loads(changes)
+                        engine = get_strategy_engine()
+                        plan_result = engine.generate_code_plan(strategy, changes)
+                        if plan_result.get('success'):
+                            plans_dir = Path('cache/code_plans')
+                            plans_dir.mkdir(parents=True, exist_ok=True)
+                            plan_file = plans_dir / f"strategy_{strategy_id}_plan.md"
+                            with open(plan_file, 'w') as pf:
+                                pf.write(plan_result['plan_md'])
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=f"✅ **Plan saved** for Strategy #{strategy_id}\n\n"
+                                     f"📄 `{plan_file}`\n\n"
+                                     f"Load the MD file into an LLM for code generation."
+                            )
+                            # Send init messages so the CEO can continue
+                            await self.send_welcome_intro(bot=bot)
+                            await self._send_landing_menu_with_bot(chat_id, bot)
+                        else:
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=f"❌ Plan generation failed: {plan_result.get('error', 'Unknown error')}"
+                            )
+                            await self.send_welcome_intro(bot=bot)
+                            await self._send_landing_menu_with_bot(chat_id, bot)
+                except Exception as plan_err:
+                    logger.error(f"Plan generation failed for strategy {strategy_id}: {plan_err}", exc_info=True)
+                    await bot.send_message(chat_id=chat_id, text=f"❌ Plan generation error: {plan_err}")
+                    await self.send_welcome_intro(bot=bot)
+                    await self._send_landing_menu_with_bot(chat_id, bot)
+
+            elif action == 'code':
+                # Show confirmation before autonomous code execution
+                confirm_keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Yes, code autonomously", callback_data=f"confirm_code:{strategy_id}"),
+                        InlineKeyboardButton("⬅️ Cancel", callback_data=f"cancel_code:{strategy_id}"),
+                    ]
+                ])
+                await query.edit_message_text(
+                    f"⚠️ **Confirm Autonomous Coding**\n\n"
+                    f"Strategy #{strategy_id} will be planned, coded, and deployed to a preview branch automatically.\n\n"
+                    f"Are you sure?",
+                    reply_markup=confirm_keyboard
+                )
+                return  # Early return — don't write approval yet
+
+            elif action == 'confirm_code':
+                # Confirmed — generate plan first, then execute
+                response_type = 'approve'
+                response_text = 'Approved for autonomous coding'
+                status = 'approved'
+                self._landing_menu_selection[chat_id] = f'execute:{strategy_id}'
+                await query.edit_message_text(
+                    f"🚀 Strategy {strategy_id} approved! Generating plan and code...\n\n"
+                )
+
+            elif action == 'cancel_code':
+                # Cancelled — re-show the original strategy with buttons
+                strategy = self.db.get_strategy(strategy_id)
+                if strategy:
+                    await self.send_proposal(strategy, bot=query.get_bot())
+                else:
+                    await query.edit_message_text(f"Strategy #{strategy_id} not found.")
+                return  # Early return — no approval needed
+
+            elif action == 'delete':
+                # Show confirmation before deletion
+                confirm_keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Yes, delete permanently", callback_data=f"confirm_delete:{strategy_id}"),
+                        InlineKeyboardButton("⬅️ Cancel", callback_data=f"cancel_delete:{strategy_id}"),
+                    ]
+                ])
+                await query.edit_message_text(
+                    f"⚠️ **Confirm Deletion**\n\n"
+                    f"Strategy #{strategy_id} will be permanently removed from the database.\n\n"
+                    f"Are you sure?",
+                    reply_markup=confirm_keyboard
+                )
+                return  # Early return — don't write approval yet
+
+            elif action == 'confirm_delete':
+                # Confirmed — delete from database
+                try:
+                    self.db.delete_strategy(strategy_id)
+                    await query.edit_message_text(f"🗑️ Strategy #{strategy_id} has been deleted.")
+                except Exception as e:
+                    logger.error(f"Failed to delete strategy {strategy_id}: {e}", exc_info=True)
+                    await query.edit_message_text(f"❌ Failed to delete strategy #{strategy_id}: {e}")
+                return  # Early return — no approval needed
+
+            elif action == 'cancel_delete':
+                # Cancelled — re-show the strategy
+                strategy = self.db.get_strategy(strategy_id)
+                if strategy:
+                    status = strategy.get('status', 'failed')
+                    source = 'failed' if status == 'failed' else 'rejected'
+                    await self._handle_failed_rejected_selection_by_id(chat_id, strategy_id, source, query)
+                else:
+                    await query.edit_message_text(f"Strategy #{strategy_id} not found.")
+                return  # Early return — no approval needed
+
+            elif action == 'refine':
+                # Show "Ready for your refinement" prompt with Cancel button
+                cancel_keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Cancel", callback_data=f"cancel_refine:{strategy_id}")]
+                ])
+                self._refine_session_active[chat_id] = strategy_id
+                await query.edit_message_text(
+                    f"✏️ **Ready for your refinement**\n\n"
+                    f"Strategy #{strategy_id} — send your feedback as a text message.",
+                    reply_markup=cancel_keyboard
+                )
+                return  # Early return — wait for text message
+
+            elif action == 'cancel_refine':
+                # Cancel refinement — re-show the strategy
+                self._refine_session_active.pop(chat_id, None)
+                strategy = self.db.get_strategy(strategy_id)
+                if strategy:
+                    await self.send_proposal(strategy, bot=query.get_bot())
+                else:
+                    await query.edit_message_text(f"Strategy #{strategy_id} not found.")
+                return  # Early return
+
             elif action == 'exec':
-                # Approve and execute automatically
-                # Use 'approve' as response_type and 'approved' as status (both valid in DB)
+                # Legacy exec handler (kept for backward compatibility)
                 response_type = 'approve'
                 response_text = 'Approved for execution'
                 status = 'approved'
-                # Set landing menu selection so loop controller picks this up
                 self._landing_menu_selection[chat_id] = f'execute:{strategy_id}'
                 await query.edit_message_text(
                     f"🚀 Strategy {strategy_id} approved! Generating code and deploying to preview...\n\n{query.message.text}"
@@ -1534,19 +1903,24 @@ System: Running ✅
 
             elif action == 'split':
                 # Split a multi-change strategy into individual strategies
+                await query.edit_message_text(
+                    f"✂️ Splitting Strategy #{strategy_id} into individual strategies..."
+                )
+                bot = query.get_bot()
                 try:
                     new_ids = self.db.split_strategy(strategy_id)
                     ids_text = ", ".join([f"#{nid}" for nid in new_ids])
-                    await query.edit_message_text(
-                        f"✂️ Strategy #{strategy_id} split into {len(new_ids)} individual strategies: {ids_text}\n\n"
-                        f"Original strategy has been rejected. Use /saved to view the new strategies."
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"✅ Strategy #{strategy_id} split into {len(new_ids)} individual strategies: {ids_text}\n\n"
+                             f"Original strategy has been rejected. Use /saved to view the new strategies."
                     )
                     logger.info(f"Strategy {strategy_id} split into {new_ids}")
                 except ValueError as e:
-                    await query.edit_message_text(f"❌ Cannot split: {e}")
+                    await bot.send_message(chat_id=chat_id, text=f"❌ Cannot split: {e}")
                 except Exception as e:
                     logger.error(f"Split failed for strategy {strategy_id}: {e}", exc_info=True)
-                    await query.edit_message_text(f"❌ Split failed: {e}")
+                    await bot.send_message(chat_id=chat_id, text=f"❌ Split failed: {e}")
                 return  # Early return - no approval needed
 
             elif action == 'resume':
@@ -1721,6 +2095,18 @@ System: Running ✅
             await update.message.reply_text(f"⚠️ Unauthorized. Your chat ID: {chat_id}")
             return
 
+        # Quick strategy lookup: /25 opens Strategy #25
+        import re as _re
+        strategy_shortcut = _re.match(r'^/(\d+)$', text)
+        if strategy_shortcut:
+            sid = int(strategy_shortcut.group(1))
+            strategy = self.db.get_strategy(sid)
+            if strategy:
+                await self.send_proposal(strategy, bot=context.bot)
+            else:
+                await update.message.reply_text(f"Strategy #{sid} not found.")
+            return
+
         # Check if Q&A troubleshooting session is active - route all text to Q&A
         if chat_id in self._qa_session_active:
             strategy_id = self._qa_session_active[chat_id]
@@ -1731,6 +2117,38 @@ System: Running ✅
                 response_type='qa_response'
             )
             await update.message.reply_text("Researching your question...")
+            return
+
+        # Check if refinement session is active - route text as refinement feedback
+        if chat_id in self._refine_session_active:
+            strategy_id = self._refine_session_active.pop(chat_id)
+            logger.info(f"Refinement session active for strategy {strategy_id}, processing feedback")
+            try:
+                self.db.write_approval(
+                    strategy_id=strategy_id,
+                    user_response=text,
+                    response_type='tweak',
+                    notes=text
+                )
+                self.db.update_strategy_status(strategy_id, 'pending')
+                await update.message.reply_text(
+                    f"📝 Got it! Refining strategy #{strategy_id} based on: "
+                    f"\"{text[:50]}{'...' if len(text) > 50 else ''}\""
+                )
+
+                # Perform inline refinement
+                strategy_engine = get_strategy_engine()
+                original_strategy = self.db.get_strategy(strategy_id)
+                if original_strategy:
+                    self.db.update_strategy_status(strategy_id, 'rejected')
+                    refined = strategy_engine.refine_strategy(original_strategy, text, {})
+                    refined_id = self.db.write_strategy(refined)
+                    refined['id'] = refined_id
+                    logger.info(f"Inline refinement: strategy {strategy_id} -> {refined_id}")
+                    await self.send_proposal(refined, bot=context.bot)
+            except Exception as refine_err:
+                logger.error(f"Refinement failed: {refine_err}", exc_info=True)
+                await update.message.reply_text(f"⚠️ Refinement failed: {refine_err}")
             return
 
         # Check if user is selecting from resume list (stuck strategies)
@@ -1783,8 +2201,9 @@ System: Running ✅
                     await update.message.reply_text(
                         "No saved strategies list active. Use /saved to view saved strategies first."
                     )
-                else:
-                    await update.message.reply_text("No pending strategies to respond to.")
+                    return
+                # No pending strategy — route to conversational LLM
+                await self._handle_conversation(update, text)
                 return
 
             strategy = pending[0]
@@ -1798,20 +2217,27 @@ System: Running ✅
                 status = 'saved'
                 msg = f"📋 Strategy {strategy_id} saved for manual implementation."
 
-            # Approve and execute
-            elif text_lower in ['exec', 'execute', 'run', 'deploy', 'ship it', 'lgtm']:
+            # Plan only (generate MD plan file for human-driven code generation)
+            elif text_lower in ['plan']:
+                response_type = 'plan'
+                response_text = 'Plan requested'
+                status = 'saved'
+                msg = f"📝 Strategy {strategy_id} — generating implementation plan..."
+
+            # Approve and execute (code autonomously)
+            elif text_lower in ['code', 'exec', 'execute', 'run', 'deploy', 'ship it', 'lgtm']:
                 # Use 'approve' as response_type and 'approved' as status (both valid in DB)
                 response_type = 'approve'
-                response_text = 'Approved for execution'
+                response_text = 'Approved for autonomous coding'
                 status = 'approved'
-                msg = f"🚀 Strategy {strategy_id} approved! Generating code and deploying to preview..."
+                msg = f"🚀 Strategy {strategy_id} approved! Generating plan and code..."
 
             # Legacy approve (defaults to save)
             elif text_lower in ['approve', 'approved', 'yes', 'ok', 'okay', 'go', 'do it']:
                 response_type = 'save'
                 response_text = 'Saved for later'
                 status = 'saved'
-                msg = f"📋 Strategy {strategy_id} saved for manual implementation. (Use 'exec' or 'deploy' for auto-execution)"
+                msg = f"📋 Strategy {strategy_id} saved for manual implementation. (Use 'code' or 'deploy' for auto-execution)"
 
             # Explicit reject
             elif text_lower in ['reject', 'rejected', 'no', 'nope', 'cancel', 'stop', 'skip']:
@@ -1820,19 +2246,18 @@ System: Running ✅
                 status = 'rejected'
                 msg = f"❌ Strategy {strategy_id} rejected."
 
-            # Everything else is treated as feedback/direction for refinement
-            else:
+            # Explicit refinement via "tweak:" prefix
+            elif text_lower.startswith('tweak:') or text_lower.startswith('tweak '):
                 response_type = 'tweak'
-                # Strip "tweak:" prefix if present, but it's not required
-                feedback_text = text
-                if text_lower.startswith('tweak:'):
-                    feedback_text = text[6:].strip()
-                elif text_lower.startswith('tweak '):
-                    feedback_text = text[6:].strip()
-
+                feedback_text = text[6:].strip()
                 response_text = feedback_text
                 status = 'pending'
                 msg = f"📝 Got it! Refining strategy based on: \"{feedback_text[:50]}{'...' if len(feedback_text) > 50 else ''}\""
+
+            # Everything else is conversational — route to LLM
+            else:
+                await self._handle_conversation(update, text)
+                return
 
             # Log approval
             self.db.write_approval(
@@ -1866,9 +2291,90 @@ System: Running ✅
                         f"⚠️ Refinement failed: {refine_err}\nOriginal strategy kept as pending."
                     )
 
+            # For plan: generate MD plan file
+            if response_type == 'plan':
+                try:
+                    from pathlib import Path
+                    import json as _json
+                    strategy = self.db.get_strategy(strategy_id)
+                    if strategy:
+                        changes = strategy.get('changes', [])
+                        if isinstance(changes, str):
+                            changes = _json.loads(changes)
+                        engine = get_strategy_engine()
+                        plan_result = engine.generate_code_plan(strategy, changes)
+                        if plan_result.get('success'):
+                            plans_dir = Path('cache/code_plans')
+                            plans_dir.mkdir(parents=True, exist_ok=True)
+                            plan_file = plans_dir / f"strategy_{strategy_id}_plan.md"
+                            with open(plan_file, 'w') as pf:
+                                pf.write(plan_result['plan_md'])
+                            await update.message.reply_text(
+                                f"✅ **Plan saved** for Strategy #{strategy_id}\n\n"
+                                f"📄 `{plan_file}`\n\n"
+                                f"Load the MD file into an LLM for code generation."
+                            )
+                        else:
+                            await update.message.reply_text(
+                                f"❌ Plan generation failed: {plan_result.get('error', 'Unknown error')}"
+                            )
+                except Exception as plan_err:
+                    logger.error(f"Plan generation failed: {plan_err}", exc_info=True)
+                    await update.message.reply_text(f"❌ Plan generation error: {plan_err}")
+
         except Exception as e:
             logger.error(f"Error handling message: {e}")
             await update.message.reply_text("❌ Error processing response")
+
+    async def _handle_conversation(self, update: Update, text: str):
+        """Route a conversational message to the LLM and reply"""
+        try:
+            engine = get_strategy_engine()
+            chat_id = str(self.chat_id or update.effective_chat.id)
+
+            # Track last conversational message for resend after provider switch
+            self._last_chat_message[int(chat_id)] = text
+
+            # Load chat history from DB (limit * 2 because limit is exchanges, not messages)
+            history_limit = engine.chat_history_limit * 2
+            chat_history = self.db.get_chat_history(chat_id, limit=history_limit)
+
+            # Build context from recent strategies
+            context_parts = []
+            pending = self.db.get_pending_strategies()
+            if pending:
+                context_parts.append(f"Current pending strategy #{pending[0]['id']}: {pending[0]['summary']}")
+            saved = self.db.get_saved_strategies()
+            if saved:
+                saved_ids = ', '.join(f"#{s['id']}" for s in saved[:5])
+                context_parts.append(f"Saved strategies: {len(saved)} ({saved_ids})")
+
+            context = "\n".join(context_parts) if context_parts else ""
+
+            collector = DataCollector()
+            response = engine.chat(
+                text, context=context, db=self.db, collector=collector,
+                chat_history=chat_history
+            )
+
+            # Log both messages to history
+            self.db.log_chat_message(chat_id, 'user', text)
+            self.db.log_chat_message(chat_id, 'assistant', response)
+
+            # Store the response message for "Run as New Strategy" button
+            self._strategy_context_counter += 1
+            ctx_id = str(self._strategy_context_counter)
+            self._strategy_context_messages[ctx_id] = response
+
+            # Build dynamic action buttons based on what the LLM suggests
+            buttons = self._extract_action_buttons(response, ctx_id)
+
+            reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+            bot = update.get_bot()
+            await self._send_chunked(bot, int(chat_id), response, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"Conversation error: {e}", exc_info=True)
+            await update.message.reply_text(f"Sorry, I had trouble processing that: {e}")
 
     async def send_proposal(self, strategy: Dict, bot=None) -> bool:
         """
@@ -1928,10 +2434,12 @@ System: Running ✅
             keyboard = [
                 [
                     InlineKeyboardButton("📋 Save", callback_data=f"save:{strategy_id}"),
-                    InlineKeyboardButton("🚀 Exec", callback_data=f"exec:{strategy_id}"),
+                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
+                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
                 ],
                 [
-                    InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}")
+                    InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
                 ],
                 [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")]
             ]

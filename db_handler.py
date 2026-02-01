@@ -125,6 +125,17 @@ class DatabaseHandler:
 
         return self._retry_operation(_get)
 
+    def delete_strategy(self, strategy_id: int) -> bool:
+        """Delete a strategy and its related approvals from the database"""
+        def _delete():
+            # Delete related approvals first
+            self.client.table('approvals').delete().eq('strategy_id', strategy_id).execute()
+            # Delete the strategy
+            result = self.client.table('strategies').delete().eq('id', strategy_id).execute()
+            return len(result.data) > 0 if result.data else False
+
+        return self._retry_operation(_delete)
+
     def update_strategy_status(self, strategy_id: int, status: str, **kwargs) -> None:
         """Update strategy status and optional fields"""
         def _update():
@@ -344,7 +355,10 @@ class DatabaseHandler:
                 'gen_success_rate': data.get('gen_success_rate'),
                 'avg_session_iterations': data.get('avg_session_iterations'),
                 'period_start': data.get('period_start'),
-                'period_end': data.get('period_end')
+                'period_end': data.get('period_end'),
+                'rage_clicks': data.get('rage_clicks'),
+                'dead_clicks': data.get('dead_clicks'),
+                'quick_backs': data.get('quick_backs')
             }).execute()
 
             metric_id = result.data[0]['id']
@@ -511,6 +525,63 @@ class DatabaseHandler:
             logger.info(f"Alert {alert_id} acknowledged")
 
         self._retry_operation(_update)
+
+    # ── Chat History ──────────────────────────────────────────────────
+
+    def log_chat_message(self, chat_id: str, role: str, content: str) -> None:
+        """Log a chat message to history"""
+        def _write():
+            self.client.table('chat_history').insert({
+                'chat_id': str(chat_id),
+                'role': role,
+                'content': content,
+            }).execute()
+
+        self._retry_operation(_write)
+
+    def get_chat_history(self, chat_id: str, limit: int = 20) -> List[Dict]:
+        """Get recent chat messages for a chat, oldest first.
+        limit is the number of messages (not exchanges)."""
+        def _get():
+            result = (self.client.table('chat_history')
+                      .select('role, content, created_at')
+                      .eq('chat_id', str(chat_id))
+                      .order('created_at', desc=True)
+                      .limit(limit)
+                      .execute())
+            # Reverse so oldest is first
+            return list(reversed(result.data)) if result.data else []
+
+        return self._retry_operation(_get)
+
+    def clear_chat_history(self, chat_id: str) -> None:
+        """Clear all chat history for a given chat"""
+        def _delete():
+            self.client.table('chat_history').delete().eq('chat_id', str(chat_id)).execute()
+            logger.info(f"Chat history cleared for chat_id={chat_id}")
+
+        self._retry_operation(_delete)
+
+    # ============ SETTINGS ============
+
+    def get_setting(self, key: str) -> Optional[str]:
+        """Get a setting value by key, or None if not set"""
+        def _get():
+            result = self.client.table('settings').select('value').eq('key', key).execute()
+            if result.data:
+                return result.data[0]['value']
+            return None
+        return self._retry_operation(_get)
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Upsert a setting (insert or update)"""
+        def _set():
+            self.client.table('settings').upsert(
+                {'key': key, 'value': value, 'updated_at': datetime.utcnow().isoformat()},
+                on_conflict='key'
+            ).execute()
+            logger.info(f"Setting saved: {key}={value}")
+        self._retry_operation(_set)
 
 
 # Singleton instance

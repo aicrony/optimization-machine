@@ -1,12 +1,16 @@
 """
 AI Strategy Engine
-Generates optimization strategies using Claude (Anthropic API)
+Generates optimization strategies using Claude (Anthropic API) or Ollama (local LLM)
 """
 
 import os
 import json
 import logging
+import subprocess
+import fnmatch
+from pathlib import Path
 from typing import Dict, List, Optional, Any
+import requests
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -29,7 +33,7 @@ class StrategyEngine:
     # Sonnet: Balanced - for most strategy work
     # Opus: Most capable - for complex planning or fallback when others fail
     DEFAULT_MODELS = {
-        'haiku': 'claude-haiku-4-5-20251212',
+        'haiku': 'claude-haiku-4-5-20251001',
         'sonnet': 'claude-sonnet-4-5-20250929',
         'opus': 'claude-opus-4-5-20251101',
     }
@@ -39,16 +43,34 @@ class StrategyEngine:
         'strategy_generation': 'sonnet',   # Main strategy work
         'strategy_refinement': 'sonnet',   # Refining based on feedback
         'code_generation': 'sonnet',       # Generating actual code changes
+        'code_planning': 'sonnet',         # Pre-generation planning step
         'evaluation': 'haiku',             # Evaluating results (simpler task)
         'trend_analysis': 'haiku',         # Trend analysis (simpler task)
+        'dependency_analysis': 'haiku',    # Dependency analysis between changes
+        'conversation': 'haiku',             # Conversational chat with CEO
     }
 
     def __init__(self):
-        api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY must be set in config.env")
+        # ── Available providers from env (comma-separated); first is default ──
+        providers_str = os.getenv('LLM_PROVIDERS', os.getenv('LLM_PROVIDER', 'anthropic'))
+        self.available_providers = [p.strip().lower() for p in providers_str.split(',') if p.strip()]
+        self.llm_provider = self.available_providers[0] if self.available_providers else 'anthropic'
 
-        self.client = Anthropic(api_key=api_key)
+        # Always init Ollama config (lightweight — no connection needed)
+        self.ollama_base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
+        self.ollama_model = os.getenv('OLLAMA_MODEL', 'openhermes2.5-mistral')
+
+        # Init Anthropic client if API key is available
+        self.client = None
+        api_key = os.getenv('ANTHROPIC_API_KEY')
+        if api_key:
+            self.client = Anthropic(api_key=api_key)
+
+        if self.llm_provider == 'ollama':
+            logger.info(f"LLM: Ollama (model: {self.ollama_model}, url: {self.ollama_base_url})")
+        else:
+            if not self.client:
+                raise ValueError("ANTHROPIC_API_KEY must be set in config.env when using anthropic provider")
 
         # Load model configuration from env (with defaults)
         self.models = {
@@ -58,44 +80,101 @@ class StrategyEngine:
         }
 
         # Load task-to-tier mapping from env (with defaults)
-        self.model_tiers = {
-            'strategy_generation': os.getenv('CLAUDE_TIER_STRATEGY_GENERATION',
-                                             self.DEFAULT_MODEL_TIERS['strategy_generation']),
-            'strategy_refinement': os.getenv('CLAUDE_TIER_STRATEGY_REFINEMENT',
-                                             self.DEFAULT_MODEL_TIERS['strategy_refinement']),
-            'code_generation': os.getenv('CLAUDE_TIER_CODE_GENERATION',
-                                         self.DEFAULT_MODEL_TIERS['code_generation']),
-            'evaluation': os.getenv('CLAUDE_TIER_EVALUATION',
-                                    self.DEFAULT_MODEL_TIERS['evaluation']),
-            'trend_analysis': os.getenv('CLAUDE_TIER_TREND_ANALYSIS',
-                                        self.DEFAULT_MODEL_TIERS['trend_analysis']),
-        }
+        self.model_tiers = {}
+        for task_type, default_tier in self.DEFAULT_MODEL_TIERS.items():
+            env_key = f'CLAUDE_TIER_{task_type.upper()}'
+            self.model_tiers[task_type] = os.getenv(env_key, default_tier)
 
-        logger.info(f"Strategy engine initialized with tiered Claude models: {self.model_tiers}")
+        # Optional custom system prompt identity injected once at init
+        self.agent_system_prompt = os.getenv('AGENT_SYSTEM_PROMPT', '')
+
+        # Company name used throughout prompts
+        self.company_name = os.getenv('COMPANY_NAME', 'Gentube.ai')
+
+        # Ollama context window size
+        self.ollama_num_ctx = int(os.getenv('OLLAMA_NUM_CTX', '8192'))
+
+        # Chat history limit (number of exchanges, so messages = limit * 2)
+        self.chat_history_limit = int(os.getenv('CHAT_HISTORY_LIMIT', '10'))
+
+        # Gentube app path for code search/read tools
+        app_path = os.getenv('GENTUBE_APP_PATH', '')
+        self.app_root = Path(app_path).resolve() if app_path else None
+
+        logger.info(f"Available LLM providers: {self.available_providers}, active: {self.llm_provider}")
+        if self.llm_provider != 'ollama':
+            logger.info(f"Agent LLM: Anthropic (tiered models: {self.model_tiers})")
+
+    def set_llm_provider(self, provider: str):
+        """Switch the active LLM provider at runtime"""
+        provider = provider.strip().lower()
+        if provider not in self.available_providers:
+            raise ValueError(f"Provider '{provider}' not in available providers: {self.available_providers}")
+        if provider != 'ollama' and not self.client:
+            raise ValueError("Cannot switch to anthropic — ANTHROPIC_API_KEY not configured")
+        self.llm_provider = provider
+        logger.info(f"LLM provider switched to: {provider}")
 
     def _get_model(self, task_type: str) -> str:
         """Get the appropriate model for a task type"""
         tier = self.model_tiers.get(task_type, 'sonnet')
         return self.models[tier]
 
+    def _call_ollama(self, prompt: str, system: str = None, temperature: float = 0.7) -> str:
+        """
+        Call the local Ollama API with stream disabled to collect the full response.
+
+        Args:
+            prompt: The prompt to send
+            system: Optional system prompt
+            temperature: Sampling temperature
+
+        Returns:
+            Full response text from Ollama
+        """
+        url = f"{self.ollama_base_url}/api/generate"
+        payload = {
+            "model": self.ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_ctx": self.ollama_num_ctx,
+            },
+        }
+        if system:
+            payload["system"] = system
+
+        logger.info(f"Calling Ollama ({self.ollama_model}) at {self.ollama_base_url}")
+        resp = requests.post(url, json=payload, timeout=300)
+        resp.raise_for_status()
+        result = resp.json()
+        logger.info(f"Successfully got response from Ollama ({self.ollama_model})")
+        return result.get("response", "")
+
     def _call_with_fallback(self, prompt: str, task_type: str,
                             max_tokens: int = 2000,
-                            temperature: float = 0.7) -> str:
+                            temperature: float = 0.7,
+                            system: str = None) -> str:
         """
-        Call Claude with automatic escalation on failure.
+        Call the configured LLM provider with automatic escalation on failure.
 
-        Tries the configured model first. If it fails (bad JSON, validation error),
-        escalates to the next tier: haiku -> sonnet -> opus
+        For Anthropic: tries the configured model first, escalates haiku -> sonnet -> opus.
+        For Ollama: calls the single configured model.
 
         Args:
             prompt: The prompt to send
             task_type: Type of task (for model selection)
             max_tokens: Max tokens for response
             temperature: Sampling temperature
+            system: Optional system prompt
 
         Returns:
-            Raw response text from Claude
+            Raw response text from the LLM
         """
+        if self.llm_provider == 'ollama':
+            return self._call_ollama(prompt, system=system, temperature=temperature)
+
         tier = self.model_tiers.get(task_type, 'sonnet')
         tiers_to_try = []
 
@@ -116,12 +195,15 @@ class StrategyEngine:
                 collected = ""
 
                 for continuation in range(5):
-                    response = self.client.messages.create(
+                    api_kwargs = dict(
                         model=model,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         messages=messages
                     )
+                    if system:
+                        api_kwargs['system'] = system
+                    response = self.client.messages.create(**api_kwargs)
                     chunk = response.content[0].text
                     collected += chunk
 
@@ -148,6 +230,338 @@ class StrategyEngine:
 
         # All tiers failed
         raise last_error
+
+    # ── Tool / function-calling definitions for chat() ──────────────────
+
+    CHAT_TOOLS_ANTHROPIC = [
+        {
+            "name": "get_latest_metrics",
+            "description": "Get the most recent metric snapshots from the database. Returns revenue, usage, performance, and analytics data.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Number of recent snapshots to return (default 5)", "default": 5}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "get_metrics_for_strategy",
+            "description": "Get all metric snapshots associated with a specific strategy (before and after deployment).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "strategy_id": {"type": "integer", "description": "The strategy ID to look up"}
+                },
+                "required": ["strategy_id"]
+            }
+        },
+        {
+            "name": "get_recent_feedback",
+            "description": "Get recent user feedback entries with sentiment, rating, and category.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "Number of days to look back (default 7)", "default": 7},
+                    "limit": {"type": "integer", "description": "Max entries to return (default 50)", "default": 50}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "get_strategy",
+            "description": "Look up a specific strategy by its ID. Returns full strategy details including summary, changes, status, and impact.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "strategy_id": {"type": "integer", "description": "The strategy ID"}
+                },
+                "required": ["strategy_id"]
+            }
+        },
+        {
+            "name": "get_pending_strategies",
+            "description": "List all strategies currently awaiting CEO approval.",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "get_approved_strategies",
+            "description": "List all approved strategies ready for execution.",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "get_saved_strategies",
+            "description": "List strategies that were saved for later consideration.",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "get_rejected_strategies",
+            "description": "List strategies that were rejected by the CEO.",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "get_failed_strategies",
+            "description": "List strategies that failed during execution.",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "get_stuck_strategies",
+            "description": "List strategies stuck in intermediate execution states that may need attention.",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "get_unacknowledged_alerts",
+            "description": "Get all active (unacknowledged) system alerts.",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "collect_fresh_metrics",
+            "description": "Trigger a live data collection from all sources (Stripe, GA4, CrUX, Clarity, Datastore, Supabase). Use when the CEO wants up-to-the-minute numbers.",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "search_code",
+            "description": "Search for files in the app codebase by filename pattern or by text content. Returns a list of matching file paths. MD files are listed first.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Text to search for (filename pattern or content text)"},
+                    "search_type": {"type": "string", "enum": ["filename", "content"], "description": "Search by filename or by file content"},
+                    "file_type": {"type": "string", "description": "Optional file extension filter (e.g. 'tsx', 'md', 'json'). Searches all supported types if omitted."}
+                },
+                "required": ["query", "search_type"]
+            }
+        },
+        {
+            "name": "read_file",
+            "description": "Read the contents of a file from the app codebase. Use after search_code to examine specific files.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Relative file path within the app (as returned by search_code)"}
+                },
+                "required": ["file_path"]
+            }
+        },
+    ]
+
+    # Ollama uses OpenAI-compatible tool format
+    CHAT_TOOLS_OLLAMA = [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            },
+        }
+        for t in CHAT_TOOLS_ANTHROPIC
+    ]
+
+    def _execute_tool(self, name: str, args: Dict, db, collector) -> str:
+        """Execute a tool call and return the result as a JSON string."""
+        try:
+            if name == "get_latest_metrics":
+                result = db.get_latest_metrics(limit=args.get("limit", 5))
+            elif name == "get_metrics_for_strategy":
+                result = db.get_metrics_for_strategy(args["strategy_id"])
+            elif name == "get_recent_feedback":
+                result = db.get_recent_feedback(days=args.get("days", 7), limit=args.get("limit", 50))
+            elif name == "get_strategy":
+                result = db.get_strategy(args["strategy_id"])
+            elif name == "get_pending_strategies":
+                result = db.get_pending_strategies()
+            elif name == "get_approved_strategies":
+                result = db.get_approved_strategies()
+            elif name == "get_saved_strategies":
+                result = db.get_saved_strategies()
+            elif name == "get_rejected_strategies":
+                result = db.get_rejected_strategies()
+            elif name == "get_failed_strategies":
+                result = db.get_failed_strategies()
+            elif name == "get_stuck_strategies":
+                result = db.get_stuck_strategies()
+            elif name == "get_unacknowledged_alerts":
+                result = db.get_unacknowledged_alerts()
+            elif name == "collect_fresh_metrics":
+                result = collector.collect_metrics(wait_hours=0)
+            elif name == "search_code":
+                result = self._tool_search_code(args)
+            elif name == "read_file":
+                result = self._tool_read_file(args)
+            else:
+                result = {"error": f"Unknown tool: {name}"}
+            return json.dumps(result, default=str)
+        except Exception as e:
+            logger.error(f"Tool execution error ({name}): {e}")
+            return json.dumps({"error": str(e)})
+
+    SKIP_DIRS = {'node_modules', '.next', '.git', 'dist', '.vercel', '__pycache__', '.turbo'}
+    SUPPORTED_EXTENSIONS = {'.ts', '.tsx', '.js', '.jsx', '.json', '.css', '.md', '.mdx',
+                            '.html', '.yaml', '.yml', '.env', '.sql', '.py', '.txt', '.svg'}
+
+    def _tool_search_code(self, args: Dict) -> Dict:
+        """Search for files in the Gentube app codebase."""
+        if not self.app_root or not self.app_root.exists():
+            return {"error": "GENTUBE_APP_PATH is not configured or does not exist"}
+
+        query = args.get("query", "")
+        search_type = args.get("search_type", "filename")
+        file_type = args.get("file_type")  # e.g. "tsx", "md"
+
+        if not query:
+            return {"error": "query is required"}
+
+        matches = []
+
+        if search_type == "filename":
+            for root, dirs, files in os.walk(self.app_root):
+                dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
+                for f in files:
+                    if file_type and not f.endswith(f'.{file_type}'):
+                        continue
+                    if not file_type and Path(f).suffix not in self.SUPPORTED_EXTENSIONS:
+                        continue
+                    if fnmatch.fnmatch(f.lower(), f'*{query.lower()}*'):
+                        rel = os.path.relpath(os.path.join(root, f), self.app_root)
+                        matches.append(rel)
+        else:  # content search
+            include_ext = f'*.{file_type}' if file_type else None
+            grep_args = ['grep', '-rl', '--max-count=1']
+            if include_ext:
+                grep_args += [f'--include={include_ext}']
+            else:
+                for ext in self.SUPPORTED_EXTENSIONS:
+                    grep_args += [f'--include=*{ext}']
+            for skip in self.SKIP_DIRS:
+                grep_args += [f'--exclude-dir={skip}']
+            grep_args += [query, str(self.app_root)]
+
+            try:
+                result = subprocess.run(grep_args, capture_output=True, text=True, timeout=10)
+                for line in result.stdout.strip().split('\n'):
+                    if line:
+                        rel = os.path.relpath(line.strip(), self.app_root)
+                        matches.append(rel)
+            except subprocess.TimeoutExpired:
+                return {"error": "Search timed out"}
+
+        # Sort: .md files first, then alphabetical
+        matches.sort(key=lambda p: (0 if p.endswith('.md') or p.endswith('.mdx') else 1, p))
+        matches = matches[:20]
+
+        return {"files": matches, "count": len(matches), "query": query, "search_type": search_type}
+
+    def _tool_read_file(self, args: Dict) -> Dict:
+        """Read a file from the Gentube app codebase with path traversal protection."""
+        if not self.app_root or not self.app_root.exists():
+            return {"error": "GENTUBE_APP_PATH is not configured or does not exist"}
+
+        file_path = args.get("file_path", "")
+        if not file_path:
+            return {"error": "file_path is required"}
+
+        resolved = (self.app_root / file_path).resolve()
+
+        # Security: ensure resolved path is within app root
+        if not str(resolved).startswith(str(self.app_root)):
+            return {"error": "Access denied — path is outside the app directory"}
+
+        if not resolved.is_file():
+            return {"error": f"File not found: {file_path}"}
+
+        try:
+            content = resolved.read_text(encoding='utf-8', errors='replace')
+            truncated = len(content) > 3000
+            if truncated:
+                content = content[:3000] + "\n... (truncated)"
+            return {"file_path": file_path, "content": content, "truncated": truncated}
+        except Exception as e:
+            return {"error": f"Could not read file: {e}"}
+
+    def _chat_with_tools_anthropic(self, messages: List[Dict], system: str,
+                                    db, collector) -> str:
+        """Run the Anthropic tool-calling loop."""
+        model = self.models[self.model_tiers.get('conversation', 'haiku')]
+        for _ in range(10):
+            response = self.client.messages.create(
+                model=model,
+                max_tokens=1024,
+                temperature=0.7,
+                system=system,
+                messages=messages,
+                tools=self.CHAT_TOOLS_ANTHROPIC,
+            )
+
+            # Collect text and tool_use blocks
+            text_parts = []
+            tool_calls = []
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_calls.append(block)
+
+            if not tool_calls:
+                return "\n".join(text_parts).strip()
+
+            # Append assistant response then tool results
+            messages.append({"role": "assistant", "content": response.content})
+            for tc in tool_calls:
+                logger.info(f"Tool call: {tc.name}({tc.input})")
+                result = self._execute_tool(tc.name, tc.input, db, collector)
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tc.id, "content": result}],
+                })
+
+        # Exhausted rounds — return whatever text we have
+        return "\n".join(text_parts).strip() if text_parts else "I ran out of processing steps. Please try a simpler question."
+
+    def _chat_with_tools_ollama(self, messages: List[Dict], db, collector) -> str:
+        """Run the Ollama /api/chat tool-calling loop.
+        Falls back to plain chat (no tools) if the model doesn't support tool calling."""
+        url = f"{self.ollama_base_url}/api/chat"
+        use_tools = True
+
+        for _ in range(10):
+            payload = {
+                "model": self.ollama_model,
+                "messages": messages,
+                "stream": False,
+                "options": {"num_ctx": self.ollama_num_ctx},
+            }
+            if use_tools:
+                payload["tools"] = self.CHAT_TOOLS_OLLAMA
+
+            resp = requests.post(url, json=payload, timeout=300)
+            if resp.status_code == 400 and use_tools:
+                logger.warning(f"Ollama tool calling failed (400), falling back to plain chat: {resp.text}")
+                use_tools = False
+                payload.pop("tools", None)
+                resp = requests.post(url, json=payload, timeout=300)
+            resp.raise_for_status()
+            data = resp.json()
+
+            msg = data.get("message", {})
+            tool_calls = msg.get("tool_calls")
+
+            if not tool_calls:
+                return msg.get("content", "").strip()
+
+            # Append assistant message with tool calls
+            messages.append(msg)
+
+            # Execute each tool and feed results back
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                fn_name = fn.get("name", "")
+                fn_args = fn.get("arguments", {})
+                logger.info(f"Ollama tool call: {fn_name}({fn_args})")
+                result = self._execute_tool(fn_name, fn_args, db, collector)
+                messages.append({"role": "tool", "content": result})
+
+        return msg.get("content", "").strip() if msg else "I ran out of processing steps. Please try a simpler question."
 
     def _try_repair_json(self, content: str) -> Optional[Dict]:
         """
@@ -207,7 +621,7 @@ class StrategyEngine:
 
         return None
 
-    def generate_strategy(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def generate_strategy(self, data: Dict[str, Any], ceo_context: str = None) -> Dict[str, Any]:
         """
         Generate an optimization strategy based on current data
 
@@ -218,6 +632,7 @@ class StrategyEngine:
                 - goals: Business goals (e.g., target MRR, ARPU)
                 - current_features: Current app features
                 - constraints: Constraints (e.g., budget, risk tolerance)
+            ceo_context: Optional message from CEO chat to use as direction for the strategy
 
         Returns:
             Strategy dictionary with summary, changes, expected_impact, priority
@@ -226,7 +641,7 @@ class StrategyEngine:
 
         try:
             # Prepare context for Claude
-            context = self._prepare_context(data)
+            context = self._prepare_context(data, ceo_context=ceo_context)
 
             # Generate strategy using Claude
             strategy = self._call_claude(context)
@@ -321,6 +736,225 @@ Respond ONLY with valid JSON in the same format as before (including the depende
         except Exception as e:
             logger.error(f"Error refining strategy: {e}")
             raise
+
+    def _build_business_context(self, db) -> str:
+        """Build a compact business snapshot from DB data for the system prompt.
+        Only includes fields that have real values — never N/A or None."""
+        parts = []
+        try:
+            metrics_list = db.get_latest_metrics(limit=1)
+            if metrics_list:
+                kpi = metrics_list[0].get('kpi_data', {})
+                stripe = kpi.get('stripe', {})
+                app = kpi.get('app_usage', {})
+                revenue_items = []
+                if stripe.get('mrr') is not None:
+                    revenue_items.append(f"MRR: ${stripe['mrr']}")
+                if stripe.get('revenue_30d') is not None:
+                    revenue_items.append(f"Revenue (30d): ${stripe['revenue_30d']}")
+                if stripe.get('active_customers') is not None:
+                    revenue_items.append(f"Active customers: {stripe['active_customers']}")
+                if revenue_items:
+                    parts.append(" | ".join(revenue_items))
+
+                usage_items = []
+                if app.get('dau') is not None:
+                    usage_items.append(f"DAU: {app['dau']}")
+                if app.get('mau') is not None:
+                    usage_items.append(f"MAU: {app['mau']}")
+                if metrics_list[0].get('churn_rate') is not None:
+                    usage_items.append(f"Churn: {metrics_list[0]['churn_rate']}%")
+                if usage_items:
+                    parts.append(" | ".join(usage_items))
+
+                clarity = kpi.get('clarity', {})
+                if clarity and 'error' not in clarity:
+                    ux_items = []
+                    if clarity.get('rage_clicks') is not None:
+                        ux_items.append(f"Rage clicks: {clarity['rage_clicks']}")
+                    if clarity.get('dead_clicks') is not None:
+                        ux_items.append(f"Dead clicks: {clarity['dead_clicks']}")
+                    if clarity.get('quick_backs') is not None:
+                        ux_items.append(f"Quick backs: {clarity['quick_backs']}")
+                    if ux_items:
+                        parts.append("Clarity UX: " + " | ".join(ux_items))
+        except Exception as e:
+            logger.debug(f"Could not load metrics for context: {e}")
+
+        try:
+            pending = db.get_pending_strategies()
+            if pending:
+                s = pending[0]
+                parts.append(f"Active strategy: #{s['id']} - {s['summary'][:80]} ({s['status']})")
+        except Exception as e:
+            logger.debug(f"Could not load strategies for context: {e}")
+
+        try:
+            feedback = db.get_recent_feedback(days=7, limit=50)
+            if feedback:
+                positive = sum(1 for f in feedback if f.get('sentiment') == 'positive')
+                pct = round(positive / len(feedback) * 100) if feedback else 0
+                parts.append(f"Recent feedback: {len(feedback)} entries, {pct}% positive")
+        except Exception as e:
+            logger.debug(f"Could not load feedback for context: {e}")
+
+        try:
+            alerts = db.get_unacknowledged_alerts()
+            if alerts:
+                parts.append(f"Unacknowledged alerts: {len(alerts)}")
+        except Exception as e:
+            logger.debug(f"Could not load alerts for context: {e}")
+
+        if parts:
+            return ("\n\nCurrent business snapshot (from database — only reference data shown here, "
+                    "never invent or guess numbers):\n- " + "\n- ".join(parts))
+        return ""
+
+    def chat(self, message: str, context: str = "",
+             db=None, collector=None, chat_history: List[Dict] = None) -> str:
+        """
+        Handle a conversational message from the CEO.
+
+        Args:
+            message: The user's message
+            context: Optional context about recent strategies/data
+            db: DatabaseHandler for tool calls and business context
+            collector: DataCollector for tool calls
+            chat_history: List of prior messages [{role, content}, ...]
+
+        Returns:
+            The LLM's response string
+        """
+        system_prompt = (self.agent_system_prompt + "\n\n") if self.agent_system_prompt else ""
+        system_prompt += (
+            f"You are the {self.company_name} Optimization Bot assistant. You help the CEO understand "
+            "optimization strategies, metrics, data trends, and how the optimization machine works. "
+            "You can explain strategies, suggest approaches, and answer questions about the system. "
+            "Keep responses concise and conversational — this is a Telegram chat. "
+            "Use markdown formatting sparingly (bold for emphasis only). "
+            "Only cite data that is explicitly provided in the context below — never make up or guess numbers."
+        )
+
+        # Inject business context from DB
+        if db:
+            system_prompt += self._build_business_context(db)
+
+        prompt = message
+        if context:
+            prompt = f"Context:\n{context}\n\nUser message: {message}"
+
+        try:
+            if db and collector:
+                # Build messages with history
+                if self.llm_provider == 'ollama':
+                    messages = [{"role": "system", "content": system_prompt}]
+                else:
+                    messages = []
+
+                # Append chat history
+                if chat_history:
+                    for msg in chat_history:
+                        messages.append({"role": msg["role"], "content": msg["content"]})
+
+                # Append current message
+                messages.append({"role": "user", "content": prompt})
+
+                if self.llm_provider == 'ollama':
+                    return self._chat_with_tools_ollama(messages, db, collector)
+                else:
+                    return self._chat_with_tools_anthropic(messages, system_prompt, db, collector)
+
+            # Fallback if no db/collector provided — plain LLM call
+            response = self._call_with_fallback(
+                prompt=prompt,
+                task_type='conversation',
+                max_tokens=1024,
+                temperature=0.7,
+                system=system_prompt
+            )
+            return response.strip()
+        except Exception as e:
+            logger.error(f"Chat error: {e}")
+            return f"Sorry, I encountered an error: {e}"
+
+    def generate_code_plan(self, strategy: Dict[str, Any],
+                           changes: List[Dict]) -> Dict[str, Any]:
+        """
+        Generate a detailed implementation plan as a Markdown document.
+
+        The LLM outputs the plan directly as markdown, ready to be saved
+        as an .md file and loaded into an LLM later for code generation.
+
+        Args:
+            strategy: The approved strategy
+            changes: List of changes to implement
+
+        Returns:
+            Dictionary with success status and markdown content string
+        """
+        logger.info("Generating code plan before code generation...")
+
+        strategy_id = strategy.get('id', '?')
+        changes_summary = json.dumps(changes, indent=2)[:3000]
+
+        prompt = f"""You are planning the implementation of code changes for {self.company_name} (Next.js/React/TypeScript).
+
+## Strategy #{strategy_id}
+{strategy.get('summary', 'N/A')}
+
+## Changes to Implement
+{changes_summary}
+
+## Your Task
+Write a comprehensive implementation plan as a **Markdown document** that a human or LLM can follow to generate the code. The document should be clear, detailed, and self-contained.
+
+Structure the document with these sections:
+
+1. **Overview** — Brief summary of the implementation approach
+2. **Files** — For each file to create or modify, include:
+   - File path and whether it's new or a modification
+   - Purpose of the file
+   - Key implementation details (functions, components, APIs, logic)
+   - Dependencies (imports, libraries, other files)
+   - Integration points (how it connects to existing code)
+   - Risk areas (edge cases, potential issues)
+3. **Execution Order** — Numbered list of files in dependency order
+4. **Testing Approach** — What to verify after implementation
+5. **Rollback Notes** — What to watch for, how to revert
+
+Output ONLY the raw Markdown — no JSON, no code fences wrapping the whole document. Start with a top-level heading."""
+
+        try:
+            content = self._call_with_fallback(
+                prompt=prompt,
+                task_type='code_planning',
+                max_tokens=4096,
+                temperature=0.3
+            )
+
+            # The LLM should return raw markdown, but strip any accidental wrapping
+            content = content.strip()
+            if content.startswith('```markdown'):
+                content = content[len('```markdown'):].strip()
+            elif content.startswith('```md'):
+                content = content[len('```md'):].strip()
+            elif content.startswith('```') and not content.startswith('```\n#'):
+                content = content[3:].strip()
+            if content.endswith('```'):
+                content = content[:-3].strip()
+
+            logger.info("Code plan generated as markdown")
+            return {
+                'success': True,
+                'plan_md': content
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating code plan: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
     def generate_code(self, strategy: Dict[str, Any],
                       changes: List[Dict]) -> Dict[str, Any]:
@@ -451,7 +1085,7 @@ Respond ONLY with valid JSON in the same format as before (including the depende
         """
         changes_summary = json.dumps(changes, indent=2)[:2000]  # Limit context size
 
-        prompt = f"""List the file paths needed for this Gentube.ai (Next.js/React) change.
+        prompt = f"""List the file paths needed for this {self.company_name} (Next.js/React) change.
 
 Strategy: {strategy.get('summary', 'N/A')}
 
@@ -533,7 +1167,7 @@ components/Feature.tsx"""
         if retry_hint:
             retry_instruction = f"\n**PREVIOUS ATTEMPT FAILED:** {retry_hint}\nEnsure all brackets are balanced.\n"
 
-        prompt = f"""Generate the COMPLETE content for {file_path} (Gentube.ai Next.js/React).
+        prompt = f"""Generate the COMPLETE content for {file_path} ({self.company_name} Next.js/React).
 {retry_instruction}
 Strategy: {strategy.get('summary', 'N/A')}
 
@@ -655,7 +1289,7 @@ Start your response with the first line of code (e.g., import statement):"""
             content = content[:-3]
         return content.strip()
 
-    def _prepare_context(self, data: Dict[str, Any]) -> str:
+    def _prepare_context(self, data: Dict[str, Any], ceo_context: str = None) -> str:
         """Prepare context prompt for Claude"""
         metrics = data.get('metrics', {})
         feedback = data.get('feedback', [])
@@ -684,6 +1318,7 @@ Start your response with the first line of code (e.g., import statement):"""
         kpi_data = metrics.get('kpi_data', {})
         ga_data = kpi_data.get('google_analytics', {})
         crux_data = kpi_data.get('web_vitals', {})
+        clarity_data = kpi_data.get('clarity', {})
         calculated = kpi_data.get('calculated', {})
 
         # Summarize feedback
@@ -715,6 +1350,37 @@ Start your response with the first line of code (e.g., import statement):"""
                 for event, data in conversion_events.items():
                     analytics_section += f"  - {event}: {data.get('count', 0)}\n"
 
+        # Build Clarity UX behavior section
+        clarity_section = ""
+        if clarity_data and 'error' not in clarity_data:
+            clarity_section = f"""
+## UX Behavior Analytics (Microsoft Clarity - Last 3 Days)
+- Total Sessions: {clarity_data.get('total_sessions', 'N/A')}
+- Distinct Users: {clarity_data.get('distinct_users', 'N/A')}
+- Pages per Session: {clarity_data.get('pages_per_session', 'N/A')}
+- Scroll Depth: {clarity_data.get('scroll_depth', 'N/A')}%
+- Rage Clicks: {clarity_data.get('rage_clicks', 'N/A')}
+- Dead Clicks: {clarity_data.get('dead_clicks', 'N/A')}
+- Excessive Scrolling: {clarity_data.get('excessive_scrolling', 'N/A')}
+- Quick Backs: {clarity_data.get('quick_backs', 'N/A')}
+- JS Errors: {clarity_data.get('js_errors', 'N/A')}
+- Avg Active Duration: {clarity_data.get('active_duration_avg', 'N/A')}s
+"""
+            # Add per-page UX issue breakdown
+            page_issues = clarity_data.get('page_issues', [])
+            if page_issues:
+                clarity_section += "\nUX Issues by Page (sorted by severity):\n"
+                for page in page_issues:
+                    parts = []
+                    if page.get('dead_clicks'):
+                        parts.append(f"{page['dead_clicks']} dead clicks")
+                    if page.get('rage_clicks'):
+                        parts.append(f"{page['rage_clicks']} rage clicks")
+                    if page.get('quick_backs'):
+                        parts.append(f"{page['quick_backs']} quick backs")
+                    if parts:
+                        clarity_section += f"  - {page['path']}: {', '.join(parts)}\n"
+
         # Build performance section
         performance_section = ""
         if crux_data and 'error' not in crux_data:
@@ -737,7 +1403,7 @@ Start your response with the first line of code (e.g., import statement):"""
                 performance_section += f"- Performance-Bounce Correlation: {correlation}\n"
 
         # Build context
-        context = f"""You are an AI optimization strategist for Gentube.ai, an AI image/video generation SaaS platform that aims to be "Netflix for everyday producers."
+        context = f"""You are an AI optimization strategist for {self.company_name}, an AI image/video generation SaaS platform that aims to be "Netflix for everyday producers."
 
 Your task is to analyze the current data and propose 1-3 data-driven optimization strategies that can achieve incremental gains (5-20% lifts) in key metrics.
 
@@ -753,7 +1419,7 @@ Your task is to analyze the current data and propose 1-3 data-driven optimizatio
 - Generation Success Rate: {gen_success_rate}%
 - Credit Usage: {credit_usage}
 - Avg Session Iterations: {avg_session_iterations}
-{analytics_section}{performance_section}
+{analytics_section}{clarity_section}{performance_section}
 ## User Feedback Summary
 {feedback_summary}
 
@@ -822,6 +1488,21 @@ Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
     "split_notes": "Brief note on whether changes can be safely executed independently"
   }}
 }}"""
+
+        # Inject CEO direction if provided via "Run as New Strategy" button
+        if ceo_context:
+            ceo_section = (
+                f'\n\n## CEO Direction\n'
+                f'The CEO has specifically requested this strategy based on the following conversation message. '
+                f'Use this as the primary direction and focus for the strategy while still grounding it in the data above:\n\n'
+                f'"""{ceo_context}"""\n'
+            )
+            # Insert before the JSON format instructions
+            json_marker = "Respond ONLY with valid JSON"
+            if json_marker in context:
+                context = context.replace(json_marker, ceo_section + json_marker)
+            else:
+                context += ceo_section
 
         return context
 
@@ -910,7 +1591,7 @@ Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
         logger.info("Evaluating strategy success...")
 
         try:
-            context = f"""You are evaluating the success of an optimization strategy for Gentube.ai.
+            context = f"""You are evaluating the success of an optimization strategy for {self.company_name}.
 
 ## Metrics Before Deployment
 {json.dumps(metrics_before, indent=2)}
@@ -972,7 +1653,7 @@ Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
             }
 
         try:
-            context = f"""Analyze the following historical metrics for Gentube.ai and identify trends:
+            context = f"""Analyze the following historical metrics for {self.company_name} and identify trends:
 
 {json.dumps(historical_metrics, indent=2)}
 

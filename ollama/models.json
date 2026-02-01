@@ -1,0 +1,79 @@
+{
+  "models": [
+    {
+      "name": "gpt-oss:latest",
+      "model": "gpt-oss:latest",
+      "modified_at": "2025-09-06T18:16:59.658993765-04:00",
+      "size": 13780173724,
+      "digest": "aa4295ac10c3afb60e6d711289fc6896f5aef82258997b9efdaed6d0cc4cd8b8",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "gptoss",
+        "families": ["gptoss"],
+        "parameter_size": "20.9B",
+        "quantization_level": "MXFP4"
+      }
+    },
+    {
+      "name": "gemma3:4b",
+      "model": "gemma3:4b",
+      "modified_at": "2025-05-28T19:30:58.189974671-04:00",
+      "size": 3338801804,
+      "digest": "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "gemma3",
+        "families": ["gemma3"],
+        "parameter_size": "4.3B",
+        "quantization_level": "Q4_K_M"
+      }
+    },
+    {
+      "name": "mannix/deepseek-coder-v2-lite-instruct:latest",
+      "model": "mannix/deepseek-coder-v2-lite-instruct:latest",
+      "modified_at": "2025-03-15T14:48:23.513917876-04:00",
+      "size": 8905125742,
+      "digest": "a3f7e2de49034a721d6717c525ebcf0a278a062b34f3b2ef94d5647d4f3902ef",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "deepseek2",
+        "families": ["deepseek2"],
+        "parameter_size": "15.7B",
+        "quantization_level": "Q4_0"
+      }
+    },
+    {
+      "name": "deepseek-r1:7b",
+      "model": "deepseek-r1:7b",
+      "modified_at": "2025-03-07T23:28:43.673132793-05:00",
+      "size": 4683075271,
+      "digest": "0a8c266910232fd3291e71e5ba1e058cc5af9d411192cf88b6d30e92b6e73163",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "qwen2",
+        "families": ["qwen2"],
+        "parameter_size": "7.6B",
+        "quantization_level": "Q4_K_M"
+      }
+    },
+    {
+      "name": "deepseek-coder:latest",
+      "model": "deepseek-coder:latest",
+      "modified_at": "2025-02-08T16:46:30.362575955-05:00",
+      "size": 776080839,
+      "digest": "3ddd2d3fc8d2b5fe039d18f859271132fd9c7960ef0be1864984442dc2a915d3",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "llama",
+        "families": ["llama"],
+        "parameter_size": "1B",
+        "quantization_level": "Q4_0"
+      }
+    }
+  ]
+}

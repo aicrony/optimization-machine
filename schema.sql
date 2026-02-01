@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     response_type VARCHAR(50),
     notes TEXT,
     approved_at TIMESTAMPTZ,
-    CONSTRAINT valid_response_type CHECK (response_type IN ('approve', 'reject', 'tweak', 'save', 'merge', 'discard', 'defer', 'qa_response', 'qa_try_fix', 'qa_give_up', 'build_save', 'build_fail', 'build_reject', 'build_continue', 'build_commit_save', 'manual_complete'))
+    CONSTRAINT valid_response_type CHECK (response_type IN ('approve', 'plan', 'reject', 'tweak', 'save', 'merge', 'discard', 'defer', 'qa_response', 'qa_try_fix', 'qa_give_up', 'build_save', 'build_fail', 'build_reject', 'build_continue', 'build_commit_save', 'manual_complete'))
 );
 
 -- Metrics Table
@@ -44,7 +44,10 @@ CREATE TABLE IF NOT EXISTS metrics (
     gen_success_rate DECIMAL(5, 2),
     avg_session_iterations DECIMAL(5, 2),
     period_start TIMESTAMPTZ,
-    period_end TIMESTAMPTZ
+    period_end TIMESTAMPTZ,
+    rage_clicks INTEGER,
+    dead_clicks INTEGER,
+    quick_backs INTEGER
 );
 
 -- Feedback Table
@@ -102,6 +105,16 @@ CREATE TABLE IF NOT EXISTS alerts (
     CONSTRAINT valid_severity CHECK (severity IN ('low', 'medium', 'high', 'critical'))
 );
 
+-- Chat History Table
+CREATE TABLE IF NOT EXISTS chat_history (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    chat_id VARCHAR(255) NOT NULL,
+    role VARCHAR(20) NOT NULL,
+    content TEXT NOT NULL,
+    CONSTRAINT valid_role CHECK (role IN ('user', 'assistant'))
+);
+
 -- Create indexes for better performance
 CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies(status);
 CREATE INDEX IF NOT EXISTS idx_strategies_created_at ON strategies(created_at DESC);
@@ -111,6 +124,7 @@ CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cycle_logs_started_at ON cycle_logs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_acknowledged ON alerts(acknowledged);
+CREATE INDEX IF NOT EXISTS idx_chat_history_chat_id ON chat_history(chat_id, created_at DESC);
 
 -- Create updated_at trigger function
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -125,6 +139,16 @@ $$ language 'plpgsql';
 CREATE TRIGGER update_strategies_updated_at BEFORE UPDATE ON strategies
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+-- Settings Table (runtime configuration persisted across restarts)
+CREATE TABLE IF NOT EXISTS settings (
+    id BIGSERIAL PRIMARY KEY,
+    key VARCHAR(100) UNIQUE NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_settings_key ON settings(key);
+
 -- Row Level Security (Optional - enable if needed)
 ALTER TABLE strategies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
@@ -133,3 +157,5 @@ ALTER TABLE feedback ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deployments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cycle_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE alerts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chat_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
