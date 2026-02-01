@@ -58,6 +58,7 @@ class StrategyEngine:
 
         # Always init Ollama config (lightweight — no connection needed)
         self.ollama_base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
+        self.ollama_api_key = os.getenv('OLLAMA_API_KEY', '')
         self.ollama_model = os.getenv('OLLAMA_MODEL', 'openhermes2.5-mistral')
 
         # Init Anthropic client if API key is available
@@ -145,8 +146,11 @@ class StrategyEngine:
         if system:
             payload["system"] = system
 
+        headers = {}
+        if self.ollama_api_key:
+            headers["Authorization"] = f"Bearer {self.ollama_api_key}"
         logger.info(f"Calling Ollama ({self.ollama_model}) at {self.ollama_base_url}")
-        resp = requests.post(url, json=payload, timeout=300)
+        resp = requests.post(url, json=payload, headers=headers, timeout=300)
         resp.raise_for_status()
         result = resp.json()
         logger.info(f"Successfully got response from Ollama ({self.ollama_model})")
@@ -522,6 +526,9 @@ class StrategyEngine:
         """Run the Ollama /api/chat tool-calling loop.
         Falls back to plain chat (no tools) if the model doesn't support tool calling."""
         url = f"{self.ollama_base_url}/api/chat"
+        headers = {}
+        if self.ollama_api_key:
+            headers["Authorization"] = f"Bearer {self.ollama_api_key}"
         use_tools = True
 
         for _ in range(10):
@@ -534,12 +541,12 @@ class StrategyEngine:
             if use_tools:
                 payload["tools"] = self.CHAT_TOOLS_OLLAMA
 
-            resp = requests.post(url, json=payload, timeout=300)
+            resp = requests.post(url, json=payload, headers=headers, timeout=300)
             if resp.status_code == 400 and use_tools:
                 logger.warning(f"Ollama tool calling failed (400), falling back to plain chat: {resp.text}")
                 use_tools = False
                 payload.pop("tools", None)
-                resp = requests.post(url, json=payload, timeout=300)
+                resp = requests.post(url, json=payload, headers=headers, timeout=300)
             resp.raise_for_status()
             data = resp.json()
 
