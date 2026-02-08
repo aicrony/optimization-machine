@@ -964,36 +964,92 @@ Output ONLY the raw Markdown — no JSON, no code fences wrapping the whole docu
             }
 
     def generate_code(self, strategy: Dict[str, Any],
-                      changes: List[Dict]) -> Dict[str, Any]:
+                      changes: List[Dict],
+                      plan_md: Optional[str] = None,
+                      coding_mode: str = 'autonomous',
+                      ask_question_callback: Optional[callable] = None) -> Dict[str, Any]:
         """
         Generate actual code changes for an approved strategy using multi-step generation.
 
         This uses a two-phase approach to handle arbitrarily large code changes:
-        1. Planning phase: Generate a list of files to create/modify
+        1. Planning phase: Generate a list of files to create/modify (or extract from existing plan)
         2. Generation phase: Generate each file's content separately
 
         Args:
             strategy: The approved strategy
             changes: List of changes to implement
+            plan_md: Optional existing plan markdown to use instead of generating new
+            coding_mode: 'autonomous' or 'interactive' - controls whether to ask questions
+            ask_question_callback: Callback function for interactive mode questions
 
         Returns:
             Dictionary with success status and code_changes list
         """
-        logger.info(f"Generating code for {len(changes)} changes (multi-step)...")
+        logger.info(f"Generating code for {len(changes)} changes (multi-step, mode={coding_mode})...")
 
         try:
-            # Phase 1: Generate implementation plan (list of files)
-            logger.info("Phase 1: Generating implementation plan...")
-            file_plan = self._generate_implementation_plan(strategy, changes)
+            # Phase 1: Get implementation plan (list of files)
+            if plan_md:
+                logger.info("Phase 1: Extracting file list from existing plan...")
+                file_plan = self._extract_files_from_plan(strategy, plan_md)
+            else:
+                logger.info("Phase 1: Generating implementation plan...")
+                file_plan = self._generate_implementation_plan(strategy, changes)
 
             if not file_plan.get('success'):
-                return {
-                    'success': False,
-                    'error': file_plan.get('error', 'Failed to generate implementation plan')
-                }
+                # In interactive mode, ask if user wants to provide the file list
+                if coding_mode == 'interactive' and ask_question_callback:
+                    answer = ask_question_callback(
+                        f"I couldn't automatically determine the files to create.\n\n"
+                        f"Error: {file_plan.get('error', 'Unknown')}\n\n"
+                        f"Would you like to provide guidance?",
+                        ["Skip this strategy", "Let me specify files"]
+                    )
+                    if answer and "specify" in answer.lower():
+                        # User will provide file list
+                        custom_files = ask_question_callback(
+                            "Please list the file paths to create/modify, one per line:",
+                            None
+                        )
+                        if custom_files:
+                            files_to_generate = [{'file_path': f.strip(), 'change_type': 'create', 'description': ''}
+                                                 for f in custom_files.strip().split('\n') if f.strip()]
+                            file_plan = {'success': True, 'files': files_to_generate}
+
+                if not file_plan.get('success'):
+                    return {
+                        'success': False,
+                        'error': file_plan.get('error', 'Failed to generate implementation plan')
+                    }
 
             files_to_generate = file_plan.get('files', [])
             logger.info(f"Implementation plan: {len(files_to_generate)} files to generate")
+
+            # Interactive mode: Confirm file list with user
+            if coding_mode == 'interactive' and ask_question_callback and files_to_generate:
+                file_list_str = '\n'.join([f"• {f['file_path']}" for f in files_to_generate[:15]])
+                if len(files_to_generate) > 15:
+                    file_list_str += f"\n• ... and {len(files_to_generate) - 15} more"
+
+                answer = ask_question_callback(
+                    f"I'm planning to create/modify these {len(files_to_generate)} files:\n\n"
+                    f"{file_list_str}\n\n"
+                    f"Does this look correct?",
+                    ["Yes, proceed", "No, let me adjust"]
+                )
+                if answer and "adjust" in answer.lower():
+                    custom_input = ask_question_callback(
+                        "Please provide corrections or additional files (one per line).\n"
+                        "You can also describe what should change:",
+                        None
+                    )
+                    if custom_input:
+                        # Add any new files mentioned
+                        for line in custom_input.strip().split('\n'):
+                            line = line.strip()
+                            if line and any(line.endswith(ext) for ext in ['.ts', '.tsx', '.js', '.jsx', '.json', '.css']):
+                                if not any(f['file_path'] == line for f in files_to_generate):
+                                    files_to_generate.append({'file_path': line, 'change_type': 'create', 'description': custom_input})
 
             # Phase 2: Generate each file separately
             logger.info("Phase 2: Generating file contents...")
@@ -1004,11 +1060,28 @@ Output ONLY the raw Markdown — no JSON, no code fences wrapping the whole docu
                 file_path = file_info.get('file_path', f'unknown_file_{i}')
                 logger.info(f"Generating file {i+1}/{len(files_to_generate)}: {file_path}")
 
+                # Interactive mode: Ask about specific file before generating
+                user_guidance = None
+                if coding_mode == 'interactive' and ask_question_callback:
+                    # For key files, ask for input
+                    if i == 0 or 'component' in file_path.lower() or 'page' in file_path.lower():
+                        answer = ask_question_callback(
+                            f"About to generate: `{file_path}`\n\n"
+                            f"Any specific requirements or guidance for this file?",
+                            ["No, proceed automatically", "Yes, I have input"]
+                        )
+                        if answer and "input" in answer.lower():
+                            user_guidance = ask_question_callback(
+                                f"What should I know about `{file_path}`?",
+                                None
+                            )
+
                 file_result = self._generate_single_file(
                     strategy=strategy,
                     changes=changes,
                     file_info=file_info,
-                    all_files=files_to_generate  # Context about other files
+                    all_files=files_to_generate,
+                    user_guidance=user_guidance  # Pass any user guidance
                 )
 
                 if file_result.get('success'):
@@ -1160,13 +1233,110 @@ components/Feature.tsx"""
             logger.error(f"Error generating implementation plan: {e}")
             return {'success': False, 'error': str(e)}
 
+    def _extract_files_from_plan(self, strategy: Dict[str, Any],
+                                  plan_md: str) -> Dict[str, Any]:
+        """
+        Extract file list from an existing markdown plan.
+
+        Uses the LLM to parse the plan and extract the list of files to create/modify.
+        This ensures the file list matches what was reviewed in the plan.
+
+        Args:
+            strategy: The strategy being implemented
+            plan_md: The markdown plan content
+
+        Returns:
+            Dictionary with success status and files list
+        """
+        # Truncate plan if too long
+        plan_content = plan_md[:6000] if len(plan_md) > 6000 else plan_md
+
+        prompt = f"""Extract the file paths from this implementation plan.
+
+## Plan Document
+{plan_content}
+
+## Your Task
+List ONLY the file paths mentioned in the plan, one per line.
+Include ONLY files that need to be created or modified.
+Do not include explanations, just the paths.
+
+Example output:
+app/api/example/route.ts
+lib/utils/helper.ts
+components/Feature.tsx"""
+
+        try:
+            content = self._call_with_fallback(
+                prompt=prompt,
+                task_type='code_generation',
+                max_tokens=2000,
+                temperature=0.1  # Low temperature for extraction
+            )
+
+            # Parse line-by-line - same logic as _generate_implementation_plan
+            files = []
+            seen = set()
+            valid_extensions = ['.ts', '.tsx', '.js', '.jsx', '.json', '.css', '.scss', '.py', '.sh', '.md']
+
+            for line in content.strip().split('\n'):
+                path = line.strip()
+                path = path.lstrip('-').lstrip('*').lstrip('0123456789.').strip()
+
+                if path.startswith('`') and path.endswith('`'):
+                    path = path[1:-1]
+                if path.startswith('"') and path.endswith('"'):
+                    path = path[1:-1]
+                if path.startswith("'") and path.endswith("'"):
+                    path = path[1:-1]
+
+                if not path or path in seen:
+                    continue
+                if not any(path.endswith(ext) for ext in valid_extensions):
+                    continue
+                if path.startswith('#') or path.startswith('//'):
+                    continue
+
+                seen.add(path)
+                files.append({
+                    'file_path': path,
+                    'change_type': 'create',
+                    'description': ''
+                })
+
+            if not files:
+                logger.warning("No files extracted from plan, falling back to generation")
+                return {'success': False, 'error': 'No valid file paths found in plan'}
+
+            logger.info(f"Extracted {len(files)} files from existing plan")
+            return {
+                'success': True,
+                'files': files,
+                'summary': strategy.get('summary', ''),
+                'test_commands': ['npm run lint'],
+                'from_existing_plan': True
+            }
+
+        except Exception as e:
+            logger.error(f"Error extracting files from plan: {e}")
+            return {'success': False, 'error': str(e)}
+
     def _generate_single_file(self, strategy: Dict[str, Any], changes: List[Dict],
                               file_info: Dict, all_files: List[Dict],
-                              retry_hint: Optional[str] = None) -> Dict[str, Any]:
+                              retry_hint: Optional[str] = None,
+                              user_guidance: Optional[str] = None) -> Dict[str, Any]:
         """
         Phase 2: Generate content for a single file.
 
         Uses raw code format (no JSON wrapper) to avoid escaping overhead.
+
+        Args:
+            strategy: The strategy being implemented
+            changes: List of changes to implement
+            file_info: Info about this specific file
+            all_files: List of all files being generated (for context)
+            retry_hint: Optional hint from a failed previous attempt
+            user_guidance: Optional guidance from the user (interactive mode)
         """
         file_path = file_info.get('file_path', '')
 
@@ -1174,8 +1344,12 @@ components/Feature.tsx"""
         if retry_hint:
             retry_instruction = f"\n**PREVIOUS ATTEMPT FAILED:** {retry_hint}\nEnsure all brackets are balanced.\n"
 
+        guidance_instruction = ""
+        if user_guidance:
+            guidance_instruction = f"\n**USER GUIDANCE:** {user_guidance}\n"
+
         prompt = f"""Generate the COMPLETE content for {file_path} ({self.company_name} Next.js/React).
-{retry_instruction}
+{retry_instruction}{guidance_instruction}
 Strategy: {strategy.get('summary', 'N/A')}
 
 Output ONLY the raw code - no JSON, no markdown code blocks.

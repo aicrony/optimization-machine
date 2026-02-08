@@ -285,7 +285,8 @@ class DatabaseHandler:
                           poll_interval: int = 300, response_types: Optional[List[str]] = None,
                           fast_poll_interval: int = 15, fast_poll_duration: int = 600,
                           after_timestamp: Optional[str] = None,
-                          require_new: bool = False) -> Optional[Dict]:
+                          require_new: bool = False,
+                          interrupt_check: Optional[callable] = None) -> Optional[Dict]:
         """
         Wait for user approval with adaptive polling.
 
@@ -298,9 +299,12 @@ class DatabaseHandler:
             fast_poll_duration: Duration to use fast polling in seconds (default 10 min)
             after_timestamp: Only consider approvals created after this ISO timestamp
             require_new: If True, only look for approvals created after we start waiting
+            interrupt_check: Optional callback that returns a dict if waiting should be
+                           interrupted (e.g., user selected a different strategy).
+                           The returned dict will be passed back as the result.
 
         Returns:
-            Approval dict if received, None if timeout
+            Approval dict if received, interrupt dict if interrupted, None if timeout
         """
         start_time = time.time()
         timeout_seconds = timeout_minutes * 60
@@ -314,6 +318,13 @@ class DatabaseHandler:
                     f"(fast poll: {fast_poll_interval}s for {fast_poll_duration}s, then {poll_interval}s)")
 
         while time.time() - start_time < timeout_seconds:
+            # Check for interrupt (e.g., user selected a different strategy)
+            if interrupt_check:
+                interrupt_result = interrupt_check()
+                if interrupt_result:
+                    logger.info(f"Approval wait interrupted for strategy {strategy_id}: {interrupt_result}")
+                    return interrupt_result
+
             approval = self.get_approval(strategy_id, after_timestamp=after_timestamp)
 
             if approval:

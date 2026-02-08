@@ -86,6 +86,45 @@ class LoopController:
                 return m
         return 10000000
 
+    def _check_for_strategy_switch(self, current_strategy_id: int) -> Optional[Dict]:
+        """
+        Check if the user has selected a different strategy to execute or wants to restart.
+
+        This is used as an interrupt check during wait_for_approval to allow
+        users to jump to a different strategy or start a new strategy at any time.
+
+        Args:
+            current_strategy_id: The strategy we're currently waiting on
+
+        Returns:
+            Dict with switch/restart info if user made a selection, None otherwise
+        """
+        chat_id = int(self.mobile.chat_id) if self.mobile.chat_id else None
+        if not chat_id:
+            return None
+
+        selection = self.mobile.get_menu_selection(chat_id)
+        if selection:
+            if selection == 'restart':
+                logger.info(f"Restart detected during approval of strategy {current_strategy_id}")
+                # Don't clear the selection here - let run_cycle handle it
+                return {
+                    'interrupted': True,
+                    'restart': True,
+                    'response_type': 'restart'
+                }
+            elif selection.startswith('execute:'):
+                new_strategy_id = int(selection.split(':')[1])
+                if new_strategy_id != current_strategy_id:
+                    logger.info(f"Strategy switch detected: {current_strategy_id} -> {new_strategy_id}")
+                    # Don't clear the selection here - let run_cycle handle it
+                    return {
+                        'interrupted': True,
+                        'switch_to_strategy': new_strategy_id,
+                        'response_type': 'strategy_switch'
+                    }
+        return None
+
     def _wait_for_ceo_action(self, timeout_minutes: int = 60) -> Optional[Dict]:
         """
         Send landing menu and wait for CEO to choose an action.
@@ -270,16 +309,114 @@ class LoopController:
                     logger.info(f"Approval stage result: {cycle_result['stages']['approval']['status']}")
                     if cycle_result['stages']['approval']['status'] == 'rejected':
                         cycle_result['status'] = 'rejected'
+                        self._finalize_cycle(cycle_id, cycle_result)
+                        return cycle_result
                     elif cycle_result['stages']['approval']['status'] == 'timeout':
                         cycle_result['status'] = 'timeout'
+                        self._finalize_cycle(cycle_id, cycle_result)
+                        return cycle_result
+                    elif cycle_result['stages']['approval']['status'] == 'restart':
+                        # User requested a new strategy - handle restart within the cycle
+                        logger.info("Handling restart request - generating new strategy")
+
+                        # Clear the landing menu selection
+                        chat_id = int(self.mobile.chat_id) if self.mobile.chat_id else None
+                        if chat_id:
+                            self.mobile.clear_menu_selection(chat_id)
+
+                        # Get the context message from "Run as New Strategy" button
+                        ceo_context = self.mobile.get_strategy_generation_context()
+
+                        # Notify user
+                        self.mobile.send_status_update_sync(
+                            "🔄 **Generating New Strategy**\n"
+                            "Starting fresh strategy generation based on your request..."
+                        )
+
+                        # Re-run data collection and strategy generation
+                        logger.info("Re-running Stage 1: Collecting current data...")
+                        self.mobile.send_status_update_sync("⏳ **Stage 1/7: Collecting Data**\nGathering current metrics and feedback...")
+                        cycle_result['stages']['data_collection'] = self._stage_collect_data()
+
+                        if not cycle_result['stages']['data_collection']['success']:
+                            raise Exception("Data collection failed during restart")
+
+                        logger.info("Re-running Stage 2: Generating optimization strategy...")
+                        self.mobile.send_status_update_sync("⏳ **Stage 2/7: Generating Strategy**\nAnalyzing data and creating optimization strategy...")
+                        cycle_result['stages']['strategy_generation'] = self._stage_generate_strategy(
+                            cycle_result['stages']['data_collection']['data'],
+                            ceo_context=ceo_context
+                        )
+
+                        if not cycle_result['stages']['strategy_generation']['success']:
+                            raise Exception("Strategy generation failed during restart")
+
+                        # Re-run approval for the new strategy
+                        logger.info("Re-running Stage 3: Requesting approval...")
+                        self.mobile.send_status_update_sync("⏳ **Stage 3/7: Requesting Approval**\nSending strategy proposal for your review...")
+                        cycle_result['stages']['approval'] = self._stage_request_approval(
+                            cycle_result['stages']['strategy_generation']['strategy'],
+                            data=cycle_result['stages']['data_collection']['data']
+                        )
+
+                        # Check if this new approval also failed
+                        if not cycle_result['stages']['approval']['success']:
+                            if cycle_result['stages']['approval']['status'] == 'rejected':
+                                cycle_result['status'] = 'rejected'
+                            elif cycle_result['stages']['approval']['status'] == 'timeout':
+                                cycle_result['status'] = 'timeout'
+                            else:
+                                cycle_result['status'] = 'cancelled'
+                            self._finalize_cycle(cycle_id, cycle_result)
+                            return cycle_result
                     else:
                         cycle_result['status'] = 'cancelled'
+                        self._finalize_cycle(cycle_id, cycle_result)
+                        return cycle_result
 
-                    self._finalize_cycle(cycle_id, cycle_result)
-                    return cycle_result
+                # Check if user switched to a different strategy mid-approval
+                if cycle_result['stages']['approval'].get('status') == 'strategy_switch':
+                    new_strategy_id = cycle_result['stages']['approval']['switch_to_strategy']
+                    logger.info(f"Handling strategy switch to #{new_strategy_id}")
+
+                    # Clear the landing menu selection (we're consuming it now)
+                    chat_id = int(self.mobile.chat_id) if self.mobile.chat_id else None
+                    if chat_id:
+                        self.mobile.clear_menu_selection(chat_id)
+
+                    # Fetch the new strategy
+                    new_strategy = self.db.get_strategy(new_strategy_id)
+                    if not new_strategy:
+                        raise Exception(f"Switched strategy {new_strategy_id} not found")
+
+                    # Notify user of the switch
+                    self.mobile.send_status_update_sync(
+                        f"🔄 **Switching to Strategy #{new_strategy_id}**\n"
+                        f"Proceeding with validation and code generation..."
+                    )
+
+                    # Update cycle_result to use the new strategy
+                    cycle_result['stages']['strategy_generation']['strategy'] = new_strategy
+                    cycle_result['stages']['strategy_generation']['strategy_id'] = new_strategy_id
+                    cycle_result['stages']['strategy_generation']['switched_from'] = \
+                        cycle_result['stages']['approval'].get('original_strategy', {}).get('id')
+
+                    # Update approval to indicate auto-execution
+                    cycle_result['stages']['approval'] = {
+                        'success': True,
+                        'auto_execute': True,
+                        'approval': {'response_type': 'approve'},
+                        'switched': True
+                    }
+
+                    # Update new strategy status to approved
+                    self.db.update_strategy_status(new_strategy_id, 'approved')
+                    self.db.update_execution_stage(new_strategy_id, 'waiting_approval')
+
+                    # Continue to Stage 4 (validation) with the new strategy
 
                 # Check if this is a save-only approval (no auto-execution)
-                if not cycle_result['stages']['approval'].get('auto_execute', False):
+                elif not cycle_result['stages']['approval'].get('auto_execute', False):
                     logger.info("Strategy saved for manual implementation")
                     cycle_result['status'] = 'saved'
                     self._finalize_cycle(cycle_id, cycle_result)
@@ -742,13 +879,18 @@ class LoopController:
                         'error': 'Failed to send proposal'
                     }
 
-                # Wait for approval
+                # Wait for approval (with interrupt check for strategy switches)
                 logger.info(f"Waiting for approval (timeout: {self.approval_timeout_hours} hours)...")
+
+                # Create interrupt check that detects if user selects a different strategy
+                def interrupt_check():
+                    return self._check_for_strategy_switch(strategy_id)
 
                 approval = self.db.wait_for_approval(
                     strategy_id,
                     timeout_minutes=self.approval_timeout_hours * 60,
-                    poll_interval=300  # Check every 5 minutes
+                    poll_interval=300,  # Check every 5 minutes
+                    interrupt_check=interrupt_check
                 )
 
                 if not approval:
@@ -757,6 +899,32 @@ class LoopController:
                         'success': False,
                         'status': 'timeout',
                         'message': 'Approval timeout'
+                    }
+
+                # Check if this is a strategy switch interrupt
+                if approval.get('interrupted') and approval.get('switch_to_strategy'):
+                    # User selected a different strategy - signal to run_cycle to switch
+                    new_strategy_id = approval['switch_to_strategy']
+                    logger.info(f"Strategy switch: {strategy_id} -> {new_strategy_id}")
+                    # Leave current strategy in pending/saved state (don't mark as rejected)
+                    return {
+                        'success': True,
+                        'status': 'strategy_switch',
+                        'switch_to_strategy': new_strategy_id,
+                        'original_strategy': current_strategy,
+                        'auto_execute': False  # Will be overridden by switch handling
+                    }
+
+                # Check if this is a restart interrupt (user wants new strategy)
+                if approval.get('interrupted') and approval.get('restart'):
+                    logger.info(f"Restart interrupt: abandoning strategy {strategy_id} for new generation")
+                    # Save the current strategy so it's not lost
+                    self.db.update_strategy_status(strategy_id, 'saved')
+                    return {
+                        'success': False,
+                        'status': 'restart',
+                        'original_strategy': current_strategy,
+                        'message': 'User requested new strategy generation'
                     }
 
                 response_type = approval['response_type']
@@ -961,10 +1129,24 @@ class LoopController:
         """Stage 5: Generate code and deploy to preview branch"""
         try:
             import json
+            from pathlib import Path
+
             strategy_id = strategy['id']
             changes = strategy.get('changes', [])
             if isinstance(changes, str):
                 changes = json.loads(changes)
+
+            # Get coding mode from the latest approval
+            latest_approval = self.db.get_approval(strategy_id)
+            coding_mode = 'autonomous'  # Default
+            if latest_approval and latest_approval.get('notes'):
+                notes = latest_approval['notes']
+                if 'coding_mode:interactive' in notes:
+                    coding_mode = 'interactive'
+                elif 'coding_mode:autonomous' in notes:
+                    coding_mode = 'autonomous'
+
+            logger.info(f"Coding mode for strategy {strategy_id}: {coding_mode}")
 
             # Track stage: generating code
             self.db.update_execution_stage(strategy_id, 'generating_code')
@@ -973,11 +1155,94 @@ class LoopController:
             cached_code = self.code_cache.load(strategy_id)
             if cached_code and cached_code.get('success'):
                 logger.info(f"Using cached code changes for strategy {strategy_id}")
+                self.mobile.send_status_update_sync(
+                    f"📦 **Using Cached Code** — Strategy #{strategy_id}\n\n"
+                    f"Found existing code changes in cache.\n"
+                    f"Proceeding to build and deploy..."
+                )
                 code_result = cached_code
             else:
+                # Check for existing plan file
+                plan_file = Path(f'cache/code_plans/strategy_{strategy_id}_plan.md')
+                plan_md = None
+
+                if plan_file.exists():
+                    # Use existing plan
+                    logger.info(f"Found existing plan: {plan_file}")
+                    self.mobile.send_status_update_sync(
+                        f"📋 **Using Existing Plan** — Strategy #{strategy_id}\n\n"
+                        f"Found implementation plan at:\n"
+                        f"`{plan_file}`\n\n"
+                        f"Extracting file list and generating code..."
+                    )
+                    try:
+                        with open(plan_file, 'r') as f:
+                            plan_md = f.read()
+                    except Exception as e:
+                        logger.warning(f"Failed to read plan file: {e}")
+                        plan_md = None
+                else:
+                    # Generate new plan
+                    logger.info(f"No existing plan found, generating new plan...")
+                    self.mobile.send_status_update_sync(
+                        f"📝 **Generating Implementation Plan** — Strategy #{strategy_id}\n\n"
+                        f"Creating detailed plan for code generation..."
+                    )
+
+                    plan_result = self.strategy_engine.generate_code_plan(strategy, changes)
+
+                    if plan_result.get('success'):
+                        plan_md = plan_result['plan_md']
+                        # Save the plan
+                        plans_dir = Path('cache/code_plans')
+                        plans_dir.mkdir(parents=True, exist_ok=True)
+                        with open(plan_file, 'w') as f:
+                            f.write(plan_md)
+                        logger.info(f"Plan saved to {plan_file}")
+
+                        self.mobile.send_status_update_sync(
+                            f"✅ **Plan Generated** — Strategy #{strategy_id}\n\n"
+                            f"Saved to: `{plan_file}`\n\n"
+                            f"Proceeding to code generation..."
+                        )
+                    else:
+                        logger.warning(f"Plan generation failed: {plan_result.get('error')}")
+                        self.mobile.send_status_update_sync(
+                            f"⚠️ **Plan Generation Failed** — Strategy #{strategy_id}\n\n"
+                            f"Will generate code without detailed plan.\n"
+                            f"Error: {plan_result.get('error', 'Unknown')[:200]}"
+                        )
+
+                # Milestone: Starting code generation
+                mode_emoji = "🤖" if coding_mode == 'autonomous' else "👤"
+                self.mobile.send_status_update_sync(
+                    f"⚙️ **Generating Code** — Strategy #{strategy_id}\n\n"
+                    f"Mode: {mode_emoji} {coding_mode.capitalize()}\n"
+                    f"{'Using existing plan' if plan_md else 'Generating from scratch'}...\n\n"
+                    f"{'I may ask clarifying questions during generation.' if coding_mode == 'interactive' else 'This may take a few minutes.'}"
+                )
+
+                # Create ask_question_callback for interactive mode
+                ask_question_callback = None
+                if coding_mode == 'interactive':
+                    def ask_question_callback(question: str, options: list = None) -> str:
+                        """Ask CEO a question during code generation"""
+                        return self.mobile.ask_coding_question_sync(
+                            strategy_id=strategy_id,
+                            question=question,
+                            options=options,
+                            timeout_seconds=300  # 5 minute timeout per question
+                        )
+
                 # Generate code for the changes
-                logger.info("Generating code for changes (calling Claude API)...")
-                code_result = self.strategy_engine.generate_code(strategy, changes)
+                logger.info(f"Generating code (mode={coding_mode}, has_plan={plan_md is not None})...")
+                code_result = self.strategy_engine.generate_code(
+                    strategy=strategy,
+                    changes=changes,
+                    plan_md=plan_md,
+                    coding_mode=coding_mode,
+                    ask_question_callback=ask_question_callback
+                )
 
                 if not code_result.get('success'):
                     self.db.update_execution_stage(strategy_id, 'code_generation_failed')
@@ -996,12 +1261,16 @@ class LoopController:
                 self.code_cache.save(strategy_id, code_result)
                 logger.info(f"Cached code changes for strategy {strategy_id}")
 
-                # Notify CEO that code generation is complete
+                # Milestone: Code generation complete
                 files_count = len(code_result.get('code_changes', []))
+                file_list = '\n'.join([f"• `{c.get('file_path', 'unknown')}`"
+                                       for c in code_result.get('code_changes', [])[:10]])
+                if files_count > 10:
+                    file_list += f"\n• ... and {files_count - 10} more"
+
                 self.mobile.send_status_update_sync(
-                    f"✅ **Code Generation Complete**\n\n"
-                    f"Strategy #{strategy_id}\n"
-                    f"Generated {files_count} file(s)\n\n"
+                    f"✅ **Code Generation Complete** — Strategy #{strategy_id}\n\n"
+                    f"Generated {files_count} file(s):\n{file_list}\n\n"
                     f"Proceeding to build and deploy..."
                 )
 

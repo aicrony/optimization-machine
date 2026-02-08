@@ -6,7 +6,7 @@ Sends strategy proposals via Telegram and receives approval responses
 import os
 import logging
 import asyncio
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
@@ -76,11 +76,20 @@ class MobileInterface:
         self._strategy_context_messages = {}
         self._strategy_context_counter = 0
 
+        # State for interactive coding questions
+        # Maps question_id -> {'question': str, 'options': list, 'answer': str or None, 'answered': bool}
+        self._coding_questions = {}
+        self._coding_question_counter = 0
+
         # Context message to inject into the next strategy generation cycle
         self._strategy_generation_context = None
 
         # Track last conversational chat message per chat_id (for resend after provider switch)
         self._last_chat_message = {}
+
+        # Track the currently focused strategy per chat_id (set when user views a strategy via /33 etc.)
+        # This allows the chat agent to know which strategy the CEO is asking about
+        self._focused_strategy = {}
 
         # Setup handlers
         self._setup_handlers()
@@ -147,11 +156,11 @@ class MobileInterface:
         strategy_ids = sorted(set(re.findall(r'#(\d+)', response)))
 
         for sid in strategy_ids:
-            # Check if "approve" is mentioned near this strategy ID
-            if re.search(rf'approve.*?#?{sid}|#{sid}.*?approve', response_lower):
+            # Check if "execute" or "exec" is mentioned near this strategy ID
+            if re.search(rf'execut.*?#?{sid}|#{sid}.*?execut|exec.*?#?{sid}|#{sid}.*?exec', response_lower):
                 cb = f'exec:{sid}'
                 if cb not in seen:
-                    buttons.append([InlineKeyboardButton(f'🚀 Approve #{sid}', callback_data=cb)])
+                    buttons.append([InlineKeyboardButton(f'🚀 Execute Now #{sid}', callback_data=cb)])
                     seen.add(cb)
 
             # Always add a View button for each mentioned strategy
@@ -330,16 +339,18 @@ class MobileInterface:
 /ping - Test bot connectivity
 
 **How to respond to strategies:**
+- ✅ **Approve** - Queue for execution later (CEO-approved)
 - 📋 **Save** - Save for manual implementation later
+- 🚀 **Execute Now** - Autonomous coding: generates plan, code, and deploys to preview
 - 📝 **Plan** - Generate an implementation plan (MD file) for human-led coding
-- 🚀 **Code** - Autonomous coding: generates plan, code, and deploys to preview
 - ✏️ **Refine** - Submit refinement feedback
 - ❌ **Reject** - Discard the strategy
 
 **Text shortcuts:**
+- `approve` → Queue for later execution
 - `save` / `later` / `manual` → Save for later
+- `execute` / `exec` / `code` / `deploy` / `ship it` → Execute now
 - `plan` → Generate plan only
-- `code` / `deploy` / `ship it` → Autonomous code generation
 - `reject` / `no` / `skip` → Reject
 
 **After preview deployment:**
@@ -580,17 +591,18 @@ System: Running ✅
 {changes_text}
 {dep_text}
 
-**Re-approve this strategy?**
+**What would you like to do?**
 """
 
         # Create inline keyboard with re-approval options
-        # Only Save is offered here - use /saved then Exec when the loop is ready
         keyboard = [
             [
+                InlineKeyboardButton("✅ Approve", callback_data=f"reapprove_approve:{strategy_id}"),
                 InlineKeyboardButton("📋 Save", callback_data=f"reapprove_save:{strategy_id}"),
                 InlineKeyboardButton("🗑️ Keep Rejected", callback_data=f"keep_rejected:{strategy_id}")
             ],
-            [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")]
+            [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")],
+            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")]
         ]
 
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -725,11 +737,12 @@ System: Running ✅
         if status == 'pending':
             keyboard = [
                 [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_queue:{strategy_id}"),
                     InlineKeyboardButton("📋 Save", callback_data=f"save:{strategy_id}"),
-                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
-                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
+                    InlineKeyboardButton("🚀 Execute Now", callback_data=f"code:{strategy_id}"),
                 ],
                 [
+                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
                     InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
                     InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
                 ],
@@ -737,11 +750,12 @@ System: Running ✅
             ]
             if len(changes) > 1:
                 keyboard.append([InlineKeyboardButton(f"✂️ Split into {len(changes)} strategies", callback_data=f"split:{strategy_id}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
         else:
             keyboard = [
                 [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_queue:{strategy_id}"),
                     InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
-                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
                 ],
                 [
                     InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
@@ -751,6 +765,7 @@ System: Running ✅
             ]
             if len(changes) > 1:
                 keyboard.append([InlineKeyboardButton(f"✂️ Split into {len(changes)} strategies", callback_data=f"split:{strategy_id}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
         bot = query.get_bot()
         await self._send_chunked(bot, chat_id, message, reply_markup=InlineKeyboardMarkup(keyboard))
         logger.info(f"Displayed {status} strategy {strategy_id} via pick button")
@@ -808,17 +823,19 @@ System: Running ✅
 
 💾 **Cache:** Code plans and code changes are saved in the `cache/` folder on the executing machine (`cache/code_plans/` and `cache/code_changes/`).
 
-**Re-approve this strategy?**
+**What would you like to do?**
 """
         keyboard = [
             [
+                InlineKeyboardButton("✅ Approve", callback_data=f"reapprove_approve:{strategy_id}"),
                 InlineKeyboardButton("📋 Save", callback_data=f"reapprove_save:{strategy_id}"),
                 InlineKeyboardButton("🗑️ Keep Rejected", callback_data=f"keep_rejected:{strategy_id}")
             ],
             [
                 InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}"),
                 InlineKeyboardButton("🗑️ Delete", callback_data=f"delete:{strategy_id}")
-            ]
+            ],
+            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")]
         ]
         bot = query.get_bot()
         await bot.send_message(chat_id=chat_id, text=message, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -869,18 +886,18 @@ System: Running ✅
 """
         keyboard = [
             [
-                InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
-                InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
-                InlineKeyboardButton("📋 Save", callback_data=f"save:{strategy_id}"),
+                InlineKeyboardButton("🚀 Execute Now", callback_data=f"code:{strategy_id}"),
+                InlineKeyboardButton("📋 Move to Saved", callback_data=f"save:{strategy_id}"),
             ],
             [
+                InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
                 InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
             ],
             [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")],
         ]
         if len(changes) > 1:
             keyboard.append([InlineKeyboardButton(f"✂️ Split into {len(changes)} strategies", callback_data=f"split:{strategy_id}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
 
         bot = query.get_bot()
         await self._send_chunked(bot, chat_id, message, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -915,7 +932,7 @@ System: Running ✅
 /ping - Test connectivity
 
 **How to respond to strategies:**
-📋 Save | 📝 Plan | 🚀 Code | ❌ Reject | ✏️ Refine
+✅ Approve | 📋 Save | 🚀 Execute Now | 📝 Plan | ✏️ Refine | ❌ Reject
 
 Or just chat with me — I understand the optimization system and your data.
 """
@@ -1363,29 +1380,35 @@ Or just chat with me — I understand the optimization system and your data.
         if status == 'pending':
             keyboard = [
                 [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_queue:{strategy_id}"),
                     InlineKeyboardButton("📋 Save", callback_data=f"save:{strategy_id}"),
-                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
-                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
+                    InlineKeyboardButton("🚀 Execute Now", callback_data=f"code:{strategy_id}"),
                 ],
                 [
+                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
                     InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}")
                 ],
                 [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")]
             ]
             if len(changes) > 1:
                 keyboard.append([InlineKeyboardButton(f"✂️ Split into {len(changes)} strategies", callback_data=f"split:{strategy_id}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
             message += "\n_Or reply with text to refine this strategy._"
         else:
             keyboard = [
                 [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_queue:{strategy_id}"),
                     InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
-                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
+                ],
+                [
+                    InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
                     InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
                 ],
                 [InlineKeyboardButton("✅ Manually Completed", callback_data=f"manual_complete:{strategy_id}")]
             ]
             if len(changes) > 1:
                 keyboard.append([InlineKeyboardButton(f"✂️ Split into {len(changes)} strategies", callback_data=f"split:{strategy_id}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1576,6 +1599,22 @@ Or just chat with me — I understand the optimization system and your data.
                 logger.info(f"Landing menu selection: {menu_action} from chat {chat_id}")
                 return  # Early return - menu handled
 
+            # Handle "Back to Menu" button from strategy detail pages
+            if action == 'back_to_menu':
+                bot = query.get_bot()
+                self._landing_menu_selection[chat_id] = None
+                self._saved_selection_state.pop(chat_id, None)
+                self._failed_selection_state.pop(chat_id, None)
+                self._rejected_selection_state.pop(chat_id, None)
+                self._approved_selection_state.pop(chat_id, None)
+
+                await query.edit_message_text(
+                    f"⬅️ **Returned to Menu**\n\n{query.message.text}"
+                )
+                await self._send_landing_menu_with_bot(chat_id, bot)
+                logger.info(f"Back to menu from strategy detail, chat {chat_id}")
+                return  # Early return
+
             # Handle "Run as New Strategy" button from chat messages
             if action == 'run_as_strategy':
                 ctx_id = parts[1]
@@ -1616,12 +1655,24 @@ Or just chat with me — I understand the optimization system and your data.
                             chat_id=chat_id,
                             text=f"🔄 Re-processing your last message with **{selected_provider}**..."
                         )
-                        # Build a minimal Update-like call to _handle_conversation
+                        # Build context from focused strategy (if user viewed one) or pending strategies
                         chat_id_str = str(self.chat_id or chat_id)
                         context_parts = []
-                        pending = self.db.get_pending_strategies()
-                        if pending:
-                            context_parts.append(f"Current pending strategy #{pending[0]['id']}: {pending[0]['summary']}")
+
+                        # Check if user has a focused strategy (from viewing via /33 etc.)
+                        focused = self._focused_strategy.get(chat_id)
+                        if focused:
+                            context_parts.append(
+                                f"**Currently discussing Strategy #{focused['id']}** (status: {focused.get('status', 'unknown')}):\n"
+                                f"Summary: {focused['summary']}\n"
+                                f"Focus area: {focused.get('focus_area', 'N/A')}\n"
+                                f"Expected impact: {focused.get('expected_impact', 'N/A')}"
+                            )
+                        else:
+                            pending = self.db.get_pending_strategies()
+                            if pending:
+                                context_parts.append(f"Current pending strategy #{pending[0]['id']}: {pending[0]['summary']}")
+
                         saved = self.db.get_saved_strategies()
                         if saved:
                             saved_ids = ', '.join(f"#{s['id']}" for s in saved[:5])
@@ -1709,6 +1760,24 @@ Or just chat with me — I understand the optimization system and your data.
                 bot = query.get_bot()
                 await self._send_landing_menu_with_bot(chat_id, bot)
 
+            elif action == 'approve_queue':
+                # Approve strategy and add to approved queue (for execution later)
+                # Write to DB immediately so the landing menu shows updated counts
+                self.db.write_approval(
+                    strategy_id=strategy_id,
+                    user_response='Approved for later execution',
+                    response_type='approve'
+                )
+                self.db.update_strategy_status(strategy_id, 'approved')
+                await query.edit_message_text(
+                    f"✅ Strategy {strategy_id} approved and queued for execution.\n\n{query.message.text}"
+                )
+                # Auto-respond with landing menu
+                bot = query.get_bot()
+                await self._send_landing_menu_with_bot(chat_id, bot)
+                logger.info(f"Strategy {strategy_id} approved and queued via callback")
+                return  # Early return — approval already written
+
             elif action == 'plan':
                 # Generate plan only (no autonomous code execution)
                 response_type = 'plan'
@@ -1762,23 +1831,71 @@ Or just chat with me — I understand the optimization system and your data.
                     await self._send_landing_menu_with_bot(chat_id, bot)
 
             elif action == 'code':
-                # Show confirmation before autonomous code execution
-                confirm_keyboard = InlineKeyboardMarkup([
+                # Show coding mode selection
+                mode_keyboard = InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton("✅ Yes, code autonomously", callback_data=f"confirm_code:{strategy_id}"),
+                        InlineKeyboardButton("🤖 Autonomous", callback_data=f"coding_mode_auto:{strategy_id}"),
+                        InlineKeyboardButton("👤 Interactive", callback_data=f"coding_mode_interactive:{strategy_id}"),
+                    ],
+                    [
                         InlineKeyboardButton("⬅️ Cancel", callback_data=f"cancel_code:{strategy_id}"),
                     ]
                 ])
                 await query.edit_message_text(
-                    f"⚠️ **Confirm Autonomous Coding**\n\n"
-                    f"Strategy #{strategy_id} will be planned, coded, and deployed to a preview branch automatically.\n\n"
-                    f"Are you sure?",
-                    reply_markup=confirm_keyboard
+                    f"🎯 **Select Coding Mode** — Strategy #{strategy_id}\n\n"
+                    f"**🤖 Autonomous**: Code will be generated without interruption. "
+                    f"Best for straightforward implementations.\n\n"
+                    f"**👤 Interactive**: I'll ask clarifying questions during coding. "
+                    f"Best for complex changes or when you want more control.\n\n"
+                    f"Which mode would you like?",
+                    reply_markup=mode_keyboard
                 )
-                return  # Early return — don't write approval yet
+                return  # Early return — wait for mode selection
+
+            elif action == 'coding_mode_auto':
+                # Autonomous mode selected
+                response_type = 'approve'
+                response_text = 'Approved for autonomous coding'
+                status = 'approved'
+                self._landing_menu_selection[chat_id] = f'execute:{strategy_id}'
+                await query.edit_message_text(
+                    f"🤖 **Autonomous Mode** — Strategy #{strategy_id}\n\n"
+                    f"Starting code generation. I'll notify you at each milestone."
+                )
+                # Store coding mode in notes
+                self.db.write_approval(
+                    strategy_id=strategy_id,
+                    user_response=response_text,
+                    response_type=response_type,
+                    notes='coding_mode:autonomous'
+                )
+                self.db.update_strategy_status(strategy_id, status)
+                logger.info(f"Strategy {strategy_id} approved for autonomous coding")
+                return  # Early return — approval already written
+
+            elif action == 'coding_mode_interactive':
+                # Interactive mode selected
+                response_type = 'approve'
+                response_text = 'Approved for interactive coding'
+                status = 'approved'
+                self._landing_menu_selection[chat_id] = f'execute:{strategy_id}'
+                await query.edit_message_text(
+                    f"👤 **Interactive Mode** — Strategy #{strategy_id}\n\n"
+                    f"Starting code generation. I'll ask questions when I need clarification."
+                )
+                # Store coding mode in notes
+                self.db.write_approval(
+                    strategy_id=strategy_id,
+                    user_response=response_text,
+                    response_type=response_type,
+                    notes='coding_mode:interactive'
+                )
+                self.db.update_strategy_status(strategy_id, status)
+                logger.info(f"Strategy {strategy_id} approved for interactive coding")
+                return  # Early return — approval already written
 
             elif action == 'confirm_code':
-                # Confirmed — generate plan first, then execute
+                # Legacy handler - treat as autonomous mode
                 response_type = 'approve'
                 response_text = 'Approved for autonomous coding'
                 status = 'approved'
@@ -1786,6 +1903,16 @@ Or just chat with me — I understand the optimization system and your data.
                 await query.edit_message_text(
                     f"🚀 Strategy {strategy_id} approved! Generating plan and code...\n\n"
                 )
+                # Store coding mode in notes
+                self.db.write_approval(
+                    strategy_id=strategy_id,
+                    user_response=response_text,
+                    response_type=response_type,
+                    notes='coding_mode:autonomous'
+                )
+                self.db.update_strategy_status(strategy_id, status)
+                logger.info(f"Strategy {strategy_id} approved (legacy confirm_code)")
+                return  # Early return — approval already written
 
             elif action == 'cancel_code':
                 # Cancelled — re-show the original strategy with buttons
@@ -1994,6 +2121,24 @@ Or just chat with me — I understand the optimization system and your data.
                 bot = query.get_bot()
                 await self._send_landing_menu_with_bot(chat_id, bot)
 
+            elif action == 'reapprove_approve':
+                # Re-approve a failed/rejected strategy and queue for later execution
+                # Write to DB immediately so the landing menu shows updated counts
+                self.db.write_approval(
+                    strategy_id=strategy_id,
+                    user_response='Re-approved and queued for execution',
+                    response_type='approve'
+                )
+                self.db.update_strategy_status(strategy_id, 'approved')
+                await query.edit_message_text(
+                    f"✅ Strategy {strategy_id} re-approved and queued for execution.\n\n{query.message.text}"
+                )
+                # Auto-respond with landing menu
+                bot = query.get_bot()
+                await self._send_landing_menu_with_bot(chat_id, bot)
+                logger.info(f"Strategy {strategy_id} re-approved and queued via callback")
+                return  # Early return — approval already written
+
             elif action == 'keep_rejected':
                 # Keep the strategy as rejected (no change)
                 await query.edit_message_text(
@@ -2063,6 +2208,43 @@ Or just chat with me — I understand the optimization system and your data.
                 logger.info(f"Build failure decision: {action} for strategy {strategy_id}")
                 return
 
+            elif action == 'coding_answer':
+                # Handle coding question answer selection
+                # Format: coding_answer:question_id:option_index
+                question_id = parts[1]
+                option_index = int(parts[2])
+                if question_id in self._coding_questions:
+                    options = self._coding_questions[question_id].get('options', [])
+                    if 0 <= option_index < len(options):
+                        answer = options[option_index]
+                        self.set_coding_answer(question_id, answer)
+                        await query.edit_message_text(
+                            f"✅ **Answer Received**\n\n"
+                            f"You selected: **{answer}**\n\n"
+                            f"Continuing code generation..."
+                        )
+                    else:
+                        await query.edit_message_text("❌ Invalid option selected")
+                else:
+                    await query.edit_message_text("❌ Question expired or already answered")
+                return
+
+            elif action == 'coding_answer_custom':
+                # User wants to type a custom answer
+                question_id = parts[1]
+                if question_id in self._coding_questions:
+                    # Store that we're waiting for a typed answer
+                    self._coding_questions[question_id]['waiting_custom'] = True
+                    self._coding_questions[question_id]['chat_id'] = chat_id
+                    await query.edit_message_text(
+                        f"✏️ **Type Your Answer**\n\n"
+                        f"Please type your answer as a message.\n\n"
+                        f"Original question:\n{self._coding_questions[question_id]['question']}"
+                    )
+                else:
+                    await query.edit_message_text("❌ Question expired or already answered")
+                return
+
             # Log approval in database
             if response_type:
                 self.db.write_approval(
@@ -2106,10 +2288,25 @@ Or just chat with me — I understand the optimization system and your data.
             sid = int(strategy_shortcut.group(1))
             strategy = self.db.get_strategy(sid)
             if strategy:
+                # Set this as the focused strategy for subsequent chat context
+                self._focused_strategy[chat_id] = strategy
+                logger.info(f"Focused strategy set to #{sid} for chat {chat_id}")
                 await self.send_proposal(strategy, bot=context.bot)
             else:
                 await update.message.reply_text(f"Strategy #{sid} not found.")
             return
+
+        # Check if waiting for a custom coding answer
+        for question_id, q_state in list(self._coding_questions.items()):
+            if q_state.get('waiting_custom') and q_state.get('chat_id') == chat_id:
+                self.set_coding_answer(question_id, text)
+                q_state['waiting_custom'] = False
+                await update.message.reply_text(
+                    f"✅ **Answer Received**\n\n"
+                    f"Your answer: \"{text[:100]}{'...' if len(text) > 100 else ''}\"\n\n"
+                    f"Continuing code generation..."
+                )
+                return
 
         # Check if Q&A troubleshooting session is active - route all text to Q&A
         if chat_id in self._qa_session_active:
@@ -2228,20 +2425,32 @@ Or just chat with me — I understand the optimization system and your data.
                 status = 'saved'
                 msg = f"📝 Strategy {strategy_id} — generating implementation plan..."
 
-            # Approve and execute (code autonomously)
-            elif text_lower in ['code', 'exec', 'execute', 'run', 'deploy', 'ship it', 'lgtm']:
+            # Execute now (code autonomously)
+            elif text_lower in ['code', 'exec', 'execute', 'run', 'deploy', 'ship it', 'lgtm', 'execute now']:
                 # Use 'approve' as response_type and 'approved' as status (both valid in DB)
                 response_type = 'approve'
                 response_text = 'Approved for autonomous coding'
                 status = 'approved'
+                self._landing_menu_selection[chat_id] = f'execute:{strategy_id}'
                 msg = f"🚀 Strategy {strategy_id} approved! Generating plan and code..."
 
-            # Legacy approve (defaults to save)
+            # Approve for later (queue to approved queue without executing)
             elif text_lower in ['approve', 'approved', 'yes', 'ok', 'okay', 'go', 'do it']:
-                response_type = 'save'
-                response_text = 'Saved for later'
-                status = 'saved'
-                msg = f"📋 Strategy {strategy_id} saved for manual implementation. (Use 'code' or 'deploy' for auto-execution)"
+                response_type = 'approve'
+                response_text = 'Approved for later execution'
+                status = 'approved'
+                msg = f"✅ Strategy {strategy_id} approved and queued for execution."
+                # Write DB immediately so landing menu shows updated counts
+                self.db.write_approval(
+                    strategy_id=strategy_id,
+                    user_response=response_text,
+                    response_type=response_type
+                )
+                self.db.update_strategy_status(strategy_id, status)
+                await update.message.reply_text(msg)
+                await self._send_landing_menu(chat_id)
+                logger.info(f"Strategy {strategy_id} approved and queued via message")
+                return  # Early return — already handled
 
             # Explicit reject
             elif text_lower in ['reject', 'rejected', 'no', 'nope', 'cancel', 'stop', 'skip']:
@@ -2343,11 +2552,28 @@ Or just chat with me — I understand the optimization system and your data.
             history_limit = engine.chat_history_limit * 2
             chat_history = self.db.get_chat_history(chat_id, limit=history_limit)
 
-            # Build context from recent strategies
+            # Build context from focused strategy (if user viewed one) or pending strategies
             context_parts = []
-            pending = self.db.get_pending_strategies()
-            if pending:
-                context_parts.append(f"Current pending strategy #{pending[0]['id']}: {pending[0]['summary']}")
+            chat_id_int = int(chat_id)
+
+            # Check if user has a focused strategy (from viewing via /33 etc.)
+            focused = self._focused_strategy.get(chat_id_int)
+            if focused:
+                # Include full context for the focused strategy
+                context_parts.append(
+                    f"**Currently discussing Strategy #{focused['id']}** (status: {focused.get('status', 'unknown')}):\n"
+                    f"Summary: {focused['summary']}\n"
+                    f"Focus area: {focused.get('focus_area', 'N/A')}\n"
+                    f"Expected impact: {focused.get('expected_impact', 'N/A')}"
+                )
+                logger.info(f"Using focused strategy #{focused['id']} for chat context")
+            else:
+                # Fall back to pending strategy if no focused strategy
+                pending = self.db.get_pending_strategies()
+                if pending:
+                    context_parts.append(f"Current pending strategy #{pending[0]['id']}: {pending[0]['summary']}")
+
+            # Also include list of saved strategies for reference
             saved = self.db.get_saved_strategies()
             if saved:
                 saved_ids = ', '.join(f"#{s['id']}" for s in saved[:5])
@@ -2396,6 +2622,12 @@ Or just chat with me — I understand the optimization system and your data.
 
         try:
             strategy_id = strategy['id']
+
+            # Update focused strategy for chat context (when user views a strategy proposal,
+            # subsequent chat messages should be aware of this strategy)
+            chat_id_int = int(self.chat_id)
+            self._focused_strategy[chat_id_int] = strategy
+            logger.info(f"Focused strategy updated to #{strategy_id} via send_proposal")
             summary = strategy['summary']
             expected_impact = strategy.get('expected_impact', 'N/A')
             focus_area = strategy.get('focus_area', 'N/A')
@@ -2437,11 +2669,12 @@ Or just chat with me — I understand the optimization system and your data.
             # Create inline keyboard with options
             keyboard = [
                 [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_queue:{strategy_id}"),
                     InlineKeyboardButton("📋 Save", callback_data=f"save:{strategy_id}"),
-                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
-                    InlineKeyboardButton("🚀 Code", callback_data=f"code:{strategy_id}"),
+                    InlineKeyboardButton("🚀 Execute Now", callback_data=f"code:{strategy_id}"),
                 ],
                 [
+                    InlineKeyboardButton("📝 Plan", callback_data=f"plan:{strategy_id}"),
                     InlineKeyboardButton("✏️ Refine", callback_data=f"refine:{strategy_id}"),
                     InlineKeyboardButton("❌ Reject", callback_data=f"reject:{strategy_id}"),
                 ],
@@ -2449,6 +2682,7 @@ Or just chat with me — I understand the optimization system and your data.
             ]
             if len(changes) > 1:
                 keyboard.append([InlineKeyboardButton(f"✂️ Split into {len(changes)} strategies", callback_data=f"split:{strategy_id}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             # Send message using provided bot or fallback to sender bot
@@ -2605,6 +2839,121 @@ Or just chat with me — I understand the optimization system and your data.
         except Exception as e:
             logger.error(f"Error in send_status_update_sync: {e}")
             return False
+
+    def ask_coding_question_sync(self, strategy_id: int, question: str,
+                                   options: List[str] = None,
+                                   timeout_seconds: int = 300) -> Optional[str]:
+        """
+        Ask an interactive coding question and wait for the CEO's answer.
+
+        Args:
+            strategy_id: The strategy being coded
+            question: The question to ask
+            options: Optional list of answer options (will create buttons)
+            timeout_seconds: How long to wait for an answer (default 5 minutes)
+
+        Returns:
+            The user's answer string, or None if timeout
+        """
+        import asyncio
+        import time
+        from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+
+        # Generate unique question ID
+        self._coding_question_counter += 1
+        question_id = f"cq_{strategy_id}_{self._coding_question_counter}"
+
+        # Store question state
+        self._coding_questions[question_id] = {
+            'question': question,
+            'options': options,
+            'answer': None,
+            'answered': False
+        }
+
+        async def _send_question():
+            if not self.chat_id:
+                return False
+
+            try:
+                bot = Bot(token=self.token)
+
+                # Build keyboard with options
+                keyboard = []
+                if options:
+                    # Add option buttons (2 per row)
+                    row = []
+                    for i, opt in enumerate(options):
+                        row.append(InlineKeyboardButton(
+                            opt[:30],  # Truncate long options
+                            callback_data=f"coding_answer:{question_id}:{i}"
+                        ))
+                        if len(row) == 2:
+                            keyboard.append(row)
+                            row = []
+                    if row:
+                        keyboard.append(row)
+
+                # Always add "Let me type..." option for custom answer
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "✏️ Let me type my answer...",
+                        callback_data=f"coding_answer_custom:{question_id}"
+                    )
+                ])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await bot.send_message(
+                    chat_id=self.chat_id,
+                    text=f"🤔 **Coding Question** — Strategy #{strategy_id}\n\n{question}",
+                    reply_markup=reply_markup
+                )
+                return True
+
+            except Exception as e:
+                logger.error(f"Error sending coding question: {e}")
+                return False
+
+        # Send the question
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                sent = loop.run_until_complete(_send_question())
+            finally:
+                loop.close()
+
+            if not sent:
+                return None
+
+        except Exception as e:
+            logger.error(f"Error in ask_coding_question_sync: {e}")
+            return None
+
+        # Wait for answer
+        logger.info(f"Waiting for coding question answer: {question_id}")
+        start_time = time.time()
+        while time.time() - start_time < timeout_seconds:
+            if self._coding_questions[question_id]['answered']:
+                answer = self._coding_questions[question_id]['answer']
+                # Clean up
+                del self._coding_questions[question_id]
+                logger.info(f"Coding question answered: {answer}")
+                return answer
+            time.sleep(2)  # Poll every 2 seconds
+
+        # Timeout - clean up and return None
+        logger.warning(f"Coding question timeout: {question_id}")
+        del self._coding_questions[question_id]
+        return None
+
+    def set_coding_answer(self, question_id: str, answer: str):
+        """Set the answer for a pending coding question (called by callback handler)"""
+        if question_id in self._coding_questions:
+            self._coding_questions[question_id]['answer'] = answer
+            self._coding_questions[question_id]['answered'] = True
+            logger.info(f"Coding answer set for {question_id}: {answer}")
 
     def activate_qa_session(self, chat_id: int, strategy_id: int):
         """Activate Q&A troubleshooting session for a chat"""
