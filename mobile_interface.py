@@ -163,8 +163,8 @@ class MobileInterface:
                     buttons.append([InlineKeyboardButton(f'🚀 Execute Now #{sid}', callback_data=cb)])
                     seen.add(cb)
 
-            # Always add a View button for each mentioned strategy
-            cb = f'pick:saved:{sid}'
+            # Always add a View button for each mentioned strategy (uses generic view handler)
+            cb = f'view:{sid}'
             if cb not in seen:
                 buttons.append([InlineKeyboardButton(f'🔍 View #{sid}', callback_data=cb)])
                 seen.add(cb)
@@ -274,6 +274,7 @@ class MobileInterface:
         self.app.add_handler(CommandHandler("restart", self._restart_command))
         self.app.add_handler(CommandHandler("resume", self._resume_command))
         self.app.add_handler(CommandHandler("llm", self._llm_command))
+        self.app.add_handler(CommandHandler("churn", self._churn_command))
         logger.info("Command handlers registered: /start, /help, /status, /ping, /saved, /failed, /rejected, /approved, /restart (alias), /resume, /llm")
 
         # Callback handlers for inline buttons
@@ -321,6 +322,82 @@ class MobileInterface:
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
+    async def _churn_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /churn command - generate and display churn analysis report"""
+        await update.message.reply_text("📊 Generating churn analysis report...")
+
+        try:
+            from churn_report import generate_churn_report, format_report_console
+
+            # Parse optional days argument
+            days = 30
+            if context.args:
+                try:
+                    days = int(context.args[0])
+                except ValueError:
+                    pass
+
+            # Generate the report
+            report = generate_churn_report(days=days, verbose=False)
+
+            # Format summary for Telegram (keep it concise)
+            s = report.summary
+            churn_indicator = ""
+            if s.churn_rate_change is not None:
+                if s.churn_rate_change > 0:
+                    churn_indicator = f" ↑{s.churn_rate_change:+.1f}%"
+                elif s.churn_rate_change < 0:
+                    churn_indicator = f" ↓{s.churn_rate_change:.1f}%"
+
+            # Build summary message
+            summary_msg = f"""📊 **Churn Analysis Report**
+*Period: Last {days} days*
+
+**Summary:**
+• Churn Rate: {s.current_churn_rate:.1f}%{churn_indicator if s.current_churn_rate else 'N/A'}
+• MRR Lost: ${s.mrr_lost_filtered:,.2f}
+• Churned Users: {s.total_churned_filtered} ({s.bots_filtered} bots filtered)
+• Avg Tenure: {s.avg_tenure_days:.1f} days
+
+**By Tenure Segment:**
+"""
+            for seg in ['<7d', '7-30d', '30+d']:
+                data = s.segment_breakdown.get(seg, {'count': 0, 'mrr_lost': 0, 'pct_of_total': 0})
+                if data['count'] > 0:
+                    summary_msg += f"• {seg}: {data['count']} users ({data['pct_of_total']:.0f}%), ${data['mrr_lost']:,.0f} MRR\n"
+
+            # Add top friction points
+            friction = report.friction_data
+            if friction.get('page_issues'):
+                summary_msg += "\n**Top Friction Pages:**\n"
+                for page in friction['page_issues'][:3]:
+                    path = page.get('path', '/')
+                    rage = page.get('rage_clicks', 0)
+                    dead = page.get('dead_clicks', 0)
+                    summary_msg += f"• `{path}` - {rage} rage, {dead} dead clicks\n"
+
+            # Add upcoming cancellations (future churn)
+            if report.upcoming_cancellations:
+                total_at_risk = sum(u.current_mrr for u in report.upcoming_cancellations)
+                high_priority = [u for u in report.upcoming_cancellations if u.retention_priority == 'high']
+                summary_msg += f"\n⚠️ **Upcoming Cancellations:**\n"
+                summary_msg += f"• {len(report.upcoming_cancellations)} users scheduled to cancel\n"
+                summary_msg += f"• ${total_at_risk:,.2f} MRR at risk\n"
+                if high_priority:
+                    summary_msg += f"• 🔴 {len(high_priority)} HIGH priority for retention\n"
+                # Show top 2 upcoming cancellations
+                for u in report.upcoming_cancellations[:2]:
+                    priority_icon = "🔴" if u.retention_priority == 'high' else "🟡" if u.retention_priority == 'medium' else "🟢"
+                    summary_msg += f"• {priority_icon} {u.user_id[:8]}... - ${u.current_mrr:.0f}/mo, cancels in {u.days_until_cancel}d\n"
+
+            summary_msg += f"\n📄 Full report: `cache/reports/churn_analysis.md`"
+
+            await update.message.reply_text(summary_msg, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Churn report failed: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Churn report failed: {e}")
+
     async def _help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
         help_msg = f"""
@@ -330,6 +407,7 @@ class MobileInterface:
 /start - Main menu / generate new strategy
 /help - Show this help message
 /status - Check system status
+/churn - Generate churn analysis report
 /saved - View saved & pending strategies
 /failed - View failed strategies (re-save)
 /rejected - View rejected strategies (re-save)
@@ -1662,13 +1740,27 @@ Or just chat with me — I understand the optimization system and your data.
                         # Check if user has a focused strategy (from viewing via /33 etc.)
                         focused = self._focused_strategy.get(chat_id)
                         if focused:
-                            context_parts.append(
-                                f"**Currently discussing Strategy #{focused['id']}** (status: {focused.get('status', 'unknown')}):\n"
-                                f"Summary: {focused['summary']}\n"
-                                f"Focus area: {focused.get('focus_area', 'N/A')}\n"
-                                f"Expected impact: {focused.get('expected_impact', 'N/A')}"
-                            )
-                        else:
+                            # Refresh strategy from DB to get current status
+                            refreshed = self.db.get_strategy(focused['id'])
+                            if refreshed:
+                                focused = refreshed
+                                self._focused_strategy[chat_id] = refreshed
+
+                            # Only use if still actionable
+                            inactive_statuses = {'completed', 'merged', 'discarded', 'max_refinements'}
+                            if focused.get('status') not in inactive_statuses:
+                                context_parts.append(
+                                    f"**Currently discussing Strategy #{focused['id']}** (status: {focused.get('status', 'unknown')}):\n"
+                                    f"Summary: {focused['summary']}\n"
+                                    f"Focus area: {focused.get('focus_area', 'N/A')}\n"
+                                    f"Expected impact: {focused.get('expected_impact', 'N/A')}"
+                                )
+                            else:
+                                # Clear stale focused strategy
+                                del self._focused_strategy[chat_id]
+                                focused = None
+
+                        if not focused:
                             pending = self.db.get_pending_strategies()
                             if pending:
                                 context_parts.append(f"Current pending strategy #{pending[0]['id']}: {pending[0]['summary']}")
@@ -1708,6 +1800,23 @@ Or just chat with me — I understand the optimization system and your data.
                     logger.error(f"LLM provider switch failed: {e}", exc_info=True)
                     await bot.send_message(chat_id=chat_id, text=f"⚠️ Failed to switch provider: {e}")
                 return  # Early return
+
+            # Handle generic view button (view:{strategy_id}) - works for any strategy regardless of status
+            if action == 'view':
+                view_id = int(parts[1])
+                strategy = self.db.get_strategy(view_id)
+                if strategy:
+                    # Set this as the focused strategy for chat context
+                    self._focused_strategy[chat_id] = strategy
+                    logger.info(f"Focused strategy set to #{view_id} from view button for chat {chat_id}")
+                    bot = query.get_bot()
+                    await self.send_proposal(strategy, bot=bot)
+                    await query.edit_message_text(
+                        f"📋 **Viewing Strategy #{view_id}**\n\n{query.message.text}"
+                    )
+                else:
+                    await query.edit_message_text(f"❌ Strategy #{view_id} not found.")
+                return
 
             # Handle strategy ID picker buttons (pick:{context}:{strategy_id})
             if action == 'pick':
@@ -2559,15 +2668,30 @@ Or just chat with me — I understand the optimization system and your data.
             # Check if user has a focused strategy (from viewing via /33 etc.)
             focused = self._focused_strategy.get(chat_id_int)
             if focused:
-                # Include full context for the focused strategy
-                context_parts.append(
-                    f"**Currently discussing Strategy #{focused['id']}** (status: {focused.get('status', 'unknown')}):\n"
-                    f"Summary: {focused['summary']}\n"
-                    f"Focus area: {focused.get('focus_area', 'N/A')}\n"
-                    f"Expected impact: {focused.get('expected_impact', 'N/A')}"
-                )
-                logger.info(f"Using focused strategy #{focused['id']} for chat context")
-            else:
+                # Refresh strategy from DB to get current status
+                refreshed = self.db.get_strategy(focused['id'])
+                if refreshed:
+                    focused = refreshed
+                    self._focused_strategy[chat_id_int] = refreshed
+
+                # Only use focused strategy if it's still actionable (not completed/merged/discarded)
+                inactive_statuses = {'completed', 'merged', 'discarded', 'max_refinements'}
+                if focused.get('status') not in inactive_statuses:
+                    # Include full context for the focused strategy
+                    context_parts.append(
+                        f"**Currently discussing Strategy #{focused['id']}** (status: {focused.get('status', 'unknown')}):\n"
+                        f"Summary: {focused['summary']}\n"
+                        f"Focus area: {focused.get('focus_area', 'N/A')}\n"
+                        f"Expected impact: {focused.get('expected_impact', 'N/A')}"
+                    )
+                    logger.info(f"Using focused strategy #{focused['id']} for chat context")
+                else:
+                    # Strategy is no longer actionable - clear it and fall back to pending
+                    logger.info(f"Clearing stale focused strategy #{focused['id']} (status: {focused.get('status')})")
+                    del self._focused_strategy[chat_id_int]
+                    focused = None
+
+            if not focused:
                 # Fall back to pending strategy if no focused strategy
                 pending = self.db.get_pending_strategies()
                 if pending:

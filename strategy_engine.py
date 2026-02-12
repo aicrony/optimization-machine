@@ -347,6 +347,18 @@ class StrategyEngine:
                 "required": ["file_path"]
             }
         },
+        {
+            "name": "get_churn_report",
+            "description": "Generate or retrieve the churn analysis report. Shows churned users, MRR lost, tenure segments, UX friction points from Clarity, and bot-filtered statistics. Use when the CEO asks about churn, cancellations, lost revenue, or customer retention.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "Number of days to analyze (default 30)", "default": 30},
+                    "regenerate": {"type": "boolean", "description": "Force regenerate the report instead of using cached version", "default": False}
+                },
+                "required": []
+            }
+        },
     ]
 
     # Ollama uses OpenAI-compatible tool format
@@ -393,6 +405,8 @@ class StrategyEngine:
                 result = self._tool_search_code(args)
             elif name == "read_file":
                 result = self._tool_read_file(args)
+            elif name == "get_churn_report":
+                result = self._tool_get_churn_report(args)
             else:
                 result = {"error": f"Unknown tool: {name}"}
             return json.dumps(result, default=str)
@@ -482,6 +496,98 @@ class StrategyEngine:
             return {"file_path": file_path, "content": content, "truncated": truncated}
         except Exception as e:
             return {"error": f"Could not read file: {e}"}
+
+    def _tool_get_churn_report(self, args: Dict) -> Dict:
+        """Generate or retrieve the churn analysis report."""
+        from pathlib import Path
+        import os
+
+        days = args.get("days", 30)
+        regenerate = args.get("regenerate", False)
+
+        report_path = Path("cache/reports/churn_analysis.md")
+
+        # Check if we can use cached report (less than 4 hours old)
+        use_cached = False
+        if not regenerate and report_path.exists():
+            from datetime import datetime, timedelta
+            mtime = datetime.fromtimestamp(report_path.stat().st_mtime)
+            if datetime.now() - mtime < timedelta(hours=4):
+                use_cached = True
+
+        if use_cached:
+            try:
+                content = report_path.read_text(encoding='utf-8')
+                return {
+                    "source": "cached",
+                    "report": content,
+                    "note": "Using cached report (less than 4 hours old). Set regenerate=true for fresh data."
+                }
+            except Exception as e:
+                logger.warning(f"Failed to read cached churn report: {e}")
+
+        # Generate fresh report
+        try:
+            from churn_report import generate_churn_report, format_report_markdown, save_report
+            report = generate_churn_report(days=days, verbose=False)
+            save_report(report, verbose=False)
+
+            # Return summary AND user-level details for the chat
+            summary = report.summary
+
+            # Build user-level details for churned users
+            churned_user_details = []
+            for user in report.churned_users:
+                churned_user_details.append({
+                    "email": user.email,
+                    "user_id": user.user_id,
+                    "plan": user.plan_name,
+                    "subscribed": user.subscription_start.strftime('%Y-%m-%d') if user.subscription_start else None,
+                    "cancelled": user.cancellation_date.strftime('%Y-%m-%d') if user.cancellation_date else None,
+                    "tenure_days": user.tenure_days,
+                    "mrr_lost": user.mrr_lost,
+                    "cancellation_reason": user.cancellation_reason,
+                    "total_generations": user.total_generations,
+                    "successful_generations": user.successful_generations,
+                    "failed_generations": user.failed_generations,
+                    "last_activity": user.last_activity.strftime('%Y-%m-%d %H:%M') if user.last_activity else None,
+                })
+
+            # Build user-level details for upcoming cancellations
+            upcoming_details = []
+            for user in report.upcoming_cancellations:
+                upcoming_details.append({
+                    "email": user.email,
+                    "user_id": user.user_id,
+                    "plan": user.plan_name,
+                    "cancel_at": user.cancel_at.strftime('%Y-%m-%d') if user.cancel_at else None,
+                    "days_until_cancel": user.days_until_cancel,
+                    "current_mrr": user.current_mrr,
+                    "tenure_days": user.tenure_days,
+                    "total_generations": user.total_generations,
+                    "retention_priority": user.retention_priority,
+                    "retention_notes": user.retention_notes,
+                })
+
+            return {
+                "source": "fresh",
+                "period_days": days,
+                "churn_rate": summary.current_churn_rate,
+                "churn_rate_change": summary.churn_rate_change,
+                "mrr_lost": summary.mrr_lost_filtered,
+                "churned_users_count": summary.total_churned_filtered,
+                "bots_filtered": summary.bots_filtered,
+                "avg_tenure_days": summary.avg_tenure_days,
+                "segment_breakdown": summary.segment_breakdown,
+                "top_friction_pages": report.friction_data.get('page_issues', [])[:5],
+                "cancellation_reasons": summary.cancellation_reasons,
+                "churned_users": churned_user_details,
+                "upcoming_cancellations": upcoming_details,
+                "report_file": str(report_path),
+            }
+        except Exception as e:
+            logger.error(f"Churn report generation failed: {e}")
+            return {"error": f"Failed to generate churn report: {e}"}
 
     def _chat_with_tools_anthropic(self, messages: List[Dict], system: str,
                                     db, collector) -> str:

@@ -11,6 +11,8 @@ Usage:
     python main.py bot                  # Run Telegram bot only (for testing)
     python main.py health               # Check system health
     python main.py export               # Export metrics
+    python main.py stats                # Show system statistics
+    python main.py churn-report         # Generate churn analysis report
     python main.py backfill-deps        # Backfill dependency analysis for existing strategies
 """
 
@@ -332,6 +334,20 @@ def backfill_deps():
         return 1
 
 
+def run_churn_report(days: int = 30, verbose: bool = False):
+    """Generate churn analysis report"""
+    logger.info(f"Generating churn report for last {days} days...")
+
+    try:
+        from churn_report import run_churn_report as _run_churn_report
+        return _run_churn_report(days=days, verbose=verbose)
+
+    except Exception as e:
+        logger.error(f"Churn report failed: {e}", exc_info=True)
+        print(f"\n❌ Churn report failed: {e}\n")
+        return 1
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
@@ -341,7 +357,7 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['run', 'continuous', 'bot', 'health', 'export', 'stats', 'backfill-deps'],
+        choices=['run', 'continuous', 'bot', 'health', 'export', 'stats', 'churn-report', 'backfill-deps'],
         help='Command to execute'
     )
 
@@ -356,7 +372,13 @@ def main():
         '--days',
         type=float,
         default=None,
-        help='Number of days to run (for run/continuous commands). Default: run forever'
+        help='Number of days to run (for run/continuous commands) or analyze (for churn-report). Default: run forever / 30 days'
+    )
+
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Verbose output (for churn-report command)'
     )
 
     args = parser.parse_args()
@@ -377,6 +399,9 @@ def main():
         return export_metrics(format=args.format)
     elif args.command == 'stats':
         return show_stats()
+    elif args.command == 'churn-report':
+        days = int(args.days) if args.days else 30
+        return run_churn_report(days=days, verbose=args.verbose)
     elif args.command == 'backfill-deps':
         return backfill_deps()
     else:
